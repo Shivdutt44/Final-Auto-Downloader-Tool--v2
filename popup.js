@@ -447,6 +447,11 @@ async function scrapeAllMediaFromPage() {
     if (isImage) return 'image';
     return 'other';
   }
+
+  function extractYouTubeVideoId(url) {
+    const match = url.match(/(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/);
+    return match ? match[1] : null;
+  }
   
   // Scrape all possible image elements
   const imageElements = [
@@ -504,6 +509,17 @@ async function scrapeAllMediaFromPage() {
               (element.querySelector('source') && element.querySelector('source').src);
       } else if (element.tagName === 'IFRAME') {
         src = element.src;
+        if (src && (src.includes('youtube.com') || src.includes('youtu.be'))) {
+          const videoId = extractYouTubeVideoId(src);
+          if (videoId) {
+            const thumbnailUrl = `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`;
+            mediaItems.push({
+              type: 'image',
+              url: thumbnailUrl,
+              element: `YouTube Thumbnail for ${src}`
+            });
+          }
+        }
       } else if (element.tagName === 'EMBED') {
         src = element.src;
       } else if (element.tagName === 'OBJECT') {
