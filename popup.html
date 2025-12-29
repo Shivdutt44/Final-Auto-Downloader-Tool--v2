@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Media Scraper Premium</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/zip.js@2.6.97/dist/zip.min.js"></script>
+</head>
+<body>
+  <header class="main-header">
+    <h1><i class="fas fa-camera-retro"></i> Media Scraper <span class="premium-badge">PREMIUM</span></h1>
+  </header>
+  
+  <div class="container">
+    <div class="stats">
+      <div class="stat-card">
+        <div class="stat-value" id="imageCount">0</div>
+        <div class="stat-label">Images</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="videoCount">0</div>
+        <div class="stat-label">Videos</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="otherCount">0</div>
+        <div class="stat-label">Other</div>
+      </div>
+    </div>
+    
+    <div class="filters">
+      <div class="filter-group">
+        <label for="typeFilter">Type:</label>
+        <select id="typeFilter">
+          <option value="all">All</option>
+          <option value="image">Images</option>
+          <option value="video">Videos</option>
+          <option value="svg">SVG</option>
+          <option value="data">Data URLs</option>
+          <option value="other">Other</option>
+        </select>
+      </div>
+      <div class="filter-group">
+        <label for="extensionFilter">Extension:</label>
+        <select id="extensionFilter">
+          <option value="all">All</option>
+          <!-- Will be populated dynamically -->
+        </select>
+      </div>
+    </div>
+    
+    <div class="progress-container">
+      <div class="progress-labels">
+        <span>Scraping Progress</span>
+        <span id="progressPercent">0%</span>
+      </div>
+      <div id="progressBar" class="progress-bar"></div>
+    </div>
+    
+    <div id="mediaContainer" class="media-container"></div>
+    
+    <div id="stickyDownload" class="sticky-download hidden">
+      <button id="downloadSelectedBtn" class="download-selected-btn">
+        <i class="fas fa-arrow-down"></i>
+        <span id="selectedCount">0</span> Selected
+      </button>
+      <button id="downloadZipBtn" class="download-selected-btn" style="margin-left: 10px;">
+        <i class="fas fa-file-archive"></i>
+        Download as ZIP
+      </button>
+    </div>
+    
+    <div id="previewModal" class="modal">
+      <div class="modal-content">
+        <span class="close-btn">&times;</span>
+        <div id="previewContent"></div>
+      </div>
+    </div>
+  </div>
+  
+  <footer class="main-footer">
+    © 2025, Developed By BOOST STAR Experts
+  </footer>
+  
+  <script src="popup.js"></script>
+</body>
+</html>
