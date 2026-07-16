@@ -532,18 +532,18 @@ document.addEventListener('DOMContentLoaded', function() {
     previewItem.appendChild(downloadBtn);
     
     previewContent.appendChild(previewItem);
-    previewModal.style.display = 'block';
+    previewModal.classList.add('active');
   }
   
   // Close modal
   closeBtn.addEventListener('click', () => {
-    previewModal.style.display = 'none';
+    previewModal.classList.remove('active');
   });
   
   // Close modal when clicking outside
   window.addEventListener('click', (e) => {
     if (e.target === previewModal) {
-      previewModal.style.display = 'none';
+      previewModal.classList.remove('active');
     }
   });
   
