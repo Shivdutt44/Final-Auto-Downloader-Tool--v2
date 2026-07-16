@@ -222,69 +222,37 @@ document.addEventListener('DOMContentLoaded', function() {
     const total = mediaItems.length;
 
     mediaItems.forEach((item, index) => {
-      const card = document.createElement('div');
-      card.className = 'media-card';
+      const card = document.createElement('media-card-element');
+      card.setAttribute('url', item.url);
+      card.setAttribute('type', item.type);
       if (selectedItems.has(item.url)) {
-        card.classList.add('selected');
+        card.setAttribute('selected', '');
       }
 
+      card.addEventListener('toggle-select', (e) => {
+        const checked = e.detail.checked;
+        if (checked) {
+          selectedItems.add(item.url);
+          card.setAttribute('selected', '');
+        } else {
+          selectedItems.delete(item.url);
+          card.removeAttribute('selected');
+        }
+        updateSelectedCount();
+      });
 
-      // Add checkbox for selection
-      const checkbox = document.createElement('input');
-      checkbox.type = 'checkbox';
-      checkbox.className = 'checkbox-select';
-      checkbox.checked = selectedItems.has(item.url);
-      checkbox.addEventListener('click', (e) => {
-        e.stopPropagation();
-        toggleSelection(item.url, checkbox, card);
-      });
-      card.appendChild(checkbox);
-      
-      if (item.type === 'image') {
-        const img = document.createElement('img');
-        img.src = item.url;
-        img.alt = 'Scraped image';
-        img.loading = 'lazy';
-        img.onload = () => updateProgress();
-        img.onerror = () => { updateProgress(); card.style.display = 'none'; }
-        card.appendChild(img);
-      } else if (item.type === 'video') {
-        const video = document.createElement('video');
-        video.src = item.url;
-        video.muted = true;
-        video.playsInline = true;
-        video.onloadeddata = () => updateProgress();
-        video.onerror = () => { updateProgress(); card.style.display = 'none'; }
-        card.appendChild(video);
-      } else if (item.type === 'audio') {
-        const audio = document.createElement('audio');
-        audio.src = item.url;
-        audio.controls = true;
-        audio.onloadeddata = () => updateProgress();
-        audio.onerror = () => { updateProgress(); card.style.display = 'none'; }
-        card.appendChild(audio);
-      } else {
-        const icon = document.createElement('div');
-        icon.className = 'file-icon';
-        icon.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512" fill="var(--primary-color)" style="width: 32px; height: 32px;"><path d="M0 64C0 28.7 28.7 0 64 0H224L384 160V448c0 35.3-28.7 64-64 64H64c-35.3 0-64-28.7-64-64V64zm224 0V160H352L224 64z"/></svg>`;
-        card.appendChild(icon);
-      }
-      
-      // Add eye button for preview
-      const eyeButton = document.createElement('button');
-      eyeButton.className = 'eye-button';
-      eyeButton.innerHTML = `<img src="/icons/pre1.png" alt="Preview">`;
-      eyeButton.addEventListener('click', (e) => {
-        e.stopPropagation();
+      card.addEventListener('preview-media', () => {
         showPreview(index);
       });
-      card.appendChild(eyeButton);
-      
-      // Click on card to show preview
-      card.addEventListener('click', () => {
-        showPreview(index);
+
+      card.addEventListener('media-loaded', () => {
+        updateProgress();
       });
-      
+
+      card.addEventListener('media-error', () => {
+        updateProgress();
+      });
+
       mediaContainer.appendChild(card);
       
       function updateProgress() {
@@ -965,3 +933,180 @@ async function scrapeAllMediaFromPage() {
   
   return uniqueMediaItems;
 }
+
+// Custom Web Component for Media Cards using Shadow DOM
+class MediaCardElement extends HTMLElement {
+  static get observedAttributes() {
+    return ['url', 'type', 'selected'];
+  }
+
+  constructor() {
+    super();
+    this.attachShadow({ mode: 'open' });
+  }
+
+  attributeChangedCallback(name, oldValue, newValue) {
+    if (oldValue !== newValue) {
+      this.render();
+    }
+  }
+
+  connectedCallback() {
+    this.render();
+  }
+
+  render() {
+    const url = this.getAttribute('url') || '';
+    const type = this.getAttribute('type') || '';
+    const selected = this.hasAttribute('selected');
+    
+    const style = `
+      :host {
+        display: block;
+        border-radius: 10px;
+        overflow: hidden;
+        position: relative;
+        cursor: pointer;
+        box-shadow: 0 4px 10px rgba(0,0,0,0.03);
+        transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+        background-color: white;
+        border: 2px solid transparent;
+        height: 115px;
+      }
+      :host(:hover) {
+        transform: translateY(-2px);
+        box-shadow: 0 8px 16px rgba(108, 92, 231, 0.12);
+        border-color: rgba(108, 92, 231, 0.2);
+      }
+      :host([selected]) {
+        border-color: var(--accent-color, #fd79a8);
+        box-shadow: 0 8px 20px rgba(253, 121, 168, 0.2);
+      }
+      img, video {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+      }
+      .file-icon {
+        width: 100%;
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background-color: #f7fafc;
+        color: var(--primary-color, #6c5ce7);
+      }
+      .eye-button {
+        position: absolute;
+        top: 6px;
+        right: 6px;
+        background-color: rgba(255,255,255,0.9);
+        border: none;
+        border-radius: 50%;
+        width: 26px;
+        height: 26px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+        backdrop-filter: blur(5px);
+        transition: all 0.2s ease;
+        z-index: 2;
+        opacity: 0;
+        transform: scale(0.8);
+      }
+      :host(:hover) .eye-button {
+        opacity: 1;
+        transform: scale(1);
+      }
+      .eye-button:hover {
+        transform: scale(1.1);
+        background-color: white;
+        box-shadow: 0 2px 8px rgba(108, 92, 231, 0.25);
+      }
+      .eye-button svg {
+        width: 14px;
+        height: 14px;
+        fill: #2d3436;
+      }
+      .checkbox-select {
+        position: absolute;
+        top: 6px;
+        left: 6px;
+        width: 18px;
+        height: 18px;
+        z-index: 10;
+        accent-color: var(--accent-color, #fd79a8);
+        cursor: pointer;
+        border-radius: 4px;
+      }
+      .checkbox-select:checked {
+        box-shadow: 0 0 0 2px white;
+      }
+    `;
+
+    let contentHtml = '';
+    if (type === 'image') {
+      contentHtml = `<img src="${url}" alt="Media Image" loading="lazy">`;
+    } else if (type === 'video') {
+      contentHtml = `<video src="${url}" preload="metadata" muted></video>`;
+    } else {
+      let iconSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512" fill="currentColor" style="width: 28px; height: 28px;"><path d="M0 64C0 28.7 28.7 0 64 0H224L384 160V448c0 35.3-28.7 64-64 64H64c-35.3 0-64-28.7-64-64V64zm224 0V160H352L224 64z"/></svg>`;
+      if (type === 'audio') {
+        iconSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512" fill="currentColor" style="width: 28px; height: 28px;"><path d="M192 0C86 0 0 86 0 192c0 77.4 46.2 144 112 173v47c0 17.7 14.3 32 32 32h16c17.7 0 32-14.3 32-32v-16h32v16c0 17.7 14.3 32 32 32h16c17.7 0 32-14.3 32-32v-47c65.8-29 112-95.6 112-173C384 86 298 0 192 0z"/></svg>`;
+      }
+      contentHtml = `<div class="file-icon">${iconSvg}</div>`;
+    }
+
+    this.shadowRoot.innerHTML = `
+      <style>${style}</style>
+      <input type="checkbox" class="checkbox-select" ${selected ? 'checked' : ''}>
+      ${contentHtml}
+      <button class="eye-button" title="Preview">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><path d="M288 32c-144.8 0-271.8 82.8-328 201.7c-5.9 12.5-5.9 26.9 0 39.4C16.2 391.2 143.2 474 288 474s271.8-82.8 328-201.7c5.9-12.5 5.9-26.9 0-39.4C559.8 114.8 432.8 32 288 32zM288 400c-70.7 0-128-57.3-128-128s57.3-128 128-128s128 57.3 128 128s-57.3 128-128 128zm0-208c-44.2 0-80 35.8-80 80s35.8 80 80 80s80-35.8 80-80s-35.8-80-80-80z"/></svg>
+      </button>
+    `;
+
+    const checkbox = this.shadowRoot.querySelector('.checkbox-select');
+    const eyeBtn = this.shadowRoot.querySelector('.eye-button');
+    const img = this.shadowRoot.querySelector('img');
+    const video = this.shadowRoot.querySelector('video');
+
+    const triggerLoad = () => {
+      this.dispatchEvent(new CustomEvent('media-loaded'));
+    };
+    const triggerError = () => {
+      this.style.display = 'none';
+      this.dispatchEvent(new CustomEvent('media-error'));
+    };
+
+    if (img) {
+      img.onload = triggerLoad;
+      img.onerror = triggerError;
+    } else if (video) {
+      video.onloadeddata = triggerLoad;
+      video.onerror = triggerError;
+    } else {
+      setTimeout(triggerLoad, 50);
+    }
+
+    checkbox.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.dispatchEvent(new CustomEvent('toggle-select', { detail: { checked: checkbox.checked } }));
+    });
+
+    eyeBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.dispatchEvent(new CustomEvent('preview-media'));
+    });
+
+    this.addEventListener('click', (e) => {
+      if (e.target !== this) return;
+      checkbox.checked = !checkbox.checked;
+      this.dispatchEvent(new CustomEvent('toggle-select', { detail: { checked: checkbox.checked } }));
+    });
+  }
+}
+customElements.define('media-card-element', MediaCardElement);
