@@ -2,6 +2,7 @@ document.addEventListener('DOMContentLoaded', function() {
   const mediaContainer = document.getElementById('mediaContainer');
   const imageCountElement = document.getElementById('imageCount');
   const videoCountElement = document.getElementById('videoCount');
+  const audioCountElement = document.getElementById('audioCount');
   const otherCountElement = document.getElementById('otherCount');
   const progressBar = document.getElementById('progressBar');
   const progressPercent = document.getElementById('progressPercent');
@@ -10,10 +11,12 @@ document.addEventListener('DOMContentLoaded', function() {
   const closeBtn = document.querySelector('.close-btn');
   const typeFilter = document.getElementById('typeFilter');
   const extensionFilter = document.getElementById('extensionFilter');
+  const searchFilter = document.getElementById('searchFilter');
   const stickyDownload = document.getElementById('stickyDownload');
   const downloadSelectedBtn = document.getElementById('downloadSelectedBtn');
   const downloadZipBtn = document.getElementById('downloadZipBtn');
   const selectedCount = document.getElementById('selectedCount');
+  const refreshBtn = document.getElementById('refreshBtn');
   
   let mediaData = [];
   let currentPreviewIndex = 0;
@@ -23,6 +26,11 @@ document.addEventListener('DOMContentLoaded', function() {
   
   // Auto-scrape when popup opens
   autoScrapeMedia();
+
+  // Refresh button
+  refreshBtn.addEventListener('click', () => {
+    autoScrapeMedia();
+  });
   
   async function autoScrapeMedia() {
     try {
@@ -76,16 +84,19 @@ document.addEventListener('DOMContentLoaded', function() {
   function categorizeMedia(mediaItems) {
     let images = 0;
     let videos = 0;
+    let audio = 0;
     let other = 0;
-    
+
     mediaItems.forEach(item => {
       if (item.type === 'image') images++;
       else if (item.type === 'video') videos++;
+      else if (item.type === 'audio') audio++;
       else other++;
     });
-    
+
     imageCountElement.textContent = images;
     videoCountElement.textContent = videos;
+    audioCountElement.textContent = audio;
     otherCountElement.textContent = other;
   }
   
@@ -132,7 +143,8 @@ document.addEventListener('DOMContentLoaded', function() {
   function applyFilters() {
     const typeValue = typeFilter.value;
     const extensionValue = extensionFilter.value;
-    
+    const searchValue = searchFilter.value.toLowerCase();
+
     filteredMediaData = mediaData.filter(item => {
       // Filter by type
       if (typeValue !== 'all') {
@@ -148,7 +160,7 @@ document.addEventListener('DOMContentLoaded', function() {
           return false;
         }
       }
-      
+
       // Filter by extension
       if (extensionValue !== 'all') {
         try {
@@ -162,16 +174,24 @@ document.addEventListener('DOMContentLoaded', function() {
           return false;
         }
       }
-      
+
+      // Filter by search
+      if (searchValue) {
+        if (!item.url.toLowerCase().includes(searchValue)) {
+          return false;
+        }
+      }
+
       return true;
     });
-    
+
     updateMediaDisplay(filteredMediaData);
   }
   
   // Filter event listeners
   typeFilter.addEventListener('change', applyFilters);
   extensionFilter.addEventListener('change', applyFilters);
+  searchFilter.addEventListener('input', applyFilters);
   
   function showEmptyState() {
     mediaContainer.innerHTML = `
@@ -221,7 +241,7 @@ document.addEventListener('DOMContentLoaded', function() {
         img.alt = 'Scraped image';
         img.loading = 'lazy';
         img.onload = () => updateProgress();
-        img.onerror = () => updateProgress();
+        img.onerror = () => { updateProgress(); card.style.display = 'none'; }
         card.appendChild(img);
       } else if (item.type === 'video') {
         const video = document.createElement('video');
@@ -229,8 +249,15 @@ document.addEventListener('DOMContentLoaded', function() {
         video.muted = true;
         video.playsInline = true;
         video.onloadeddata = () => updateProgress();
-        video.onerror = () => updateProgress();
+        video.onerror = () => { updateProgress(); card.style.display = 'none'; }
         card.appendChild(video);
+      } else if (item.type === 'audio') {
+        const audio = document.createElement('audio');
+        audio.src = item.url;
+        audio.controls = true;
+        audio.onloadeddata = () => updateProgress();
+        audio.onerror = () => { updateProgress(); card.style.display = 'none'; }
+        card.appendChild(audio);
       } else {
         const icon = document.createElement('div');
         icon.className = 'file-icon';
@@ -359,13 +386,22 @@ document.addEventListener('DOMContentLoaded', function() {
       const img = document.createElement('img');
       img.src = item.url;
       img.alt = 'Preview image';
+      img.onerror = () => previewItem.remove();
       previewItem.appendChild(img);
     } else if (item.type === 'video') {
       const video = document.createElement('video');
       video.src = item.url;
       video.controls = true;
       video.autoplay = true;
+      video.onerror = () => previewItem.remove();
       previewItem.appendChild(video);
+    } else if (item.type === 'audio') {
+      const audio = document.createElement('audio');
+      audio.src = item.url;
+      audio.controls = true;
+      audio.autoplay = true;
+      audio.onerror = () => previewItem.remove();
+      previewItem.appendChild(audio);
     } else {
       const icon = document.createElement('div');
       icon.className = 'file-icon-large';
@@ -418,17 +454,19 @@ document.addEventListener('DOMContentLoaded', function() {
     const url = new URL(mediaItem.url);
     const pathParts = url.pathname.split('/');
     const lastPart = pathParts[pathParts.length - 1];
-    
+
     if (lastPart && lastPart.includes('.')) {
       return lastPart;
     }
-    
-    const ext = mediaItem.type === 'image' ? 
-      (url.pathname.match(/\.(jpe?g|png|gif|webp)$/i) ? '' : '.jpg') : 
-      (mediaItem.type === 'video' ? 
-        (url.pathname.match(/\.(mp4|webm|mov)$/i) ? '' : '.mp4') : 
-        '.bin');
-    
+
+    const ext = mediaItem.type === 'image' ?
+      (url.pathname.match(/\.(jpe?g|png|gif|webp)$/i) ? '' : '.jpg') :
+      (mediaItem.type === 'video' ?
+        (url.pathname.match(/\.(mp4|webm|mov)$/i) ? '' : '.mp4') :
+        (mediaItem.type === 'audio' ?
+          (url.pathname.match(/\.(mp3|wav|ogg|flac|m4a)$/i) ? '' : '.mp3') :
+          '.bin'));
+
     return `media-${Date.now()}${ext}`;
   }
 });
@@ -441,9 +479,12 @@ async function scrapeAllMediaFromPage() {
   function getMediaType(url) {
     if (url.startsWith('data:image/')) return 'image';
     if (url.startsWith('data:video/')) return 'video';
+    if (url.startsWith('data:audio/')) return 'audio';
     const isVideo = /\.(mp4|webm|mov|youtube|vimeo)/i.test(url);
+    const isAudio = /\.(mp3|wav|ogg|flac|m4a)/i.test(url);
     const isImage = /\.(jpe?g|png|gif|webp|svg)/i.test(url);
     if (isVideo) return 'video';
+    if (isAudio) return 'audio';
     if (isImage) return 'image';
     return 'other';
   }
@@ -498,14 +539,20 @@ async function scrapeAllMediaFromPage() {
     ...document.querySelectorAll('object'),
     ...document.querySelectorAll('[data-video-src]')
   ];
+
+  // Scrape all possible audio elements
+  const audioElements = [
+    ...document.querySelectorAll('audio'),
+    ...document.querySelectorAll('[data-audio-src]')
+  ];
   
   // Process video elements
   videoElements.forEach(element => {
     try {
       let src = '';
-      
+
       if (element.tagName === 'VIDEO') {
-        src = element.src || 
+        src = element.src ||
               (element.querySelector('source') && element.querySelector('source').src);
       } else if (element.tagName === 'IFRAME') {
         src = element.src;
@@ -527,11 +574,11 @@ async function scrapeAllMediaFromPage() {
       } else if (element.hasAttribute('data-video-src')) {
         src = element.getAttribute('data-video-src');
       }
-      
+
       if (src && !src.startsWith('data:') && !src.startsWith('blob:')) {
         // Resolve relative URLs
         const absoluteUrl = new URL(src, window.location.href).href;
-        
+
         mediaItems.push({
           type: getMediaType(absoluteUrl),
           url: absoluteUrl,
@@ -542,27 +589,52 @@ async function scrapeAllMediaFromPage() {
       console.log('Error processing video element:', e);
     }
   });
+
+  // Process audio elements
+  audioElements.forEach(element => {
+    try {
+      let src = '';
+
+      if (element.tagName === 'AUDIO') {
+        src = element.src ||
+              (element.querySelector('source') && element.querySelector('source').src);
+      } else if (element.hasAttribute('data-audio-src')) {
+        src = element.getAttribute('data-audio-src');
+      }
+
+      if (src && !src.startsWith('data:') && !src.startsWith('blob:')) {
+        // Resolve relative URLs
+        const absoluteUrl = new URL(src, window.location.href).href;
+
+        mediaItems.push({
+          type: getMediaType(absoluteUrl),
+          url: absoluteUrl,
+          element: element.outerHTML.slice(0, 100) + '...'
+        });
+      }
+    } catch (e) {
+      console.log('Error processing audio element:', e);
+    }
+  });
   
   // Additional scraping for lazy-loaded and dynamically loaded media
   const potentialSources = [
     ...document.querySelectorAll('[data-src]'),
     ...document.querySelectorAll('[data-original]'),
     ...document.querySelectorAll('[data-srcset]'),
-    ...document.querySelectorAll('[data-background]')
+    ...document.querySelectorAll('[data-background]'),
+    ...document.querySelectorAll('[data-audio-src]')
   ];
 
   potentialSources.forEach(element => {
     try {
       const src = element.getAttribute('data-src') ||
                   element.getAttribute('data-original') ||
-                  element.getAttribute('data-background');
+                  element.getAttribute('data-background') ||
+                  element.getAttribute('data-audio-src');
 
       if (src && !src.startsWith('data:') && !src.startsWith('blob:')) {
         const absoluteUrl = new URL(src, window.location.href).href;
-
-        // Check if it's likely an image or video
-        const isVideo = /\.(mp4|webm|mov|youtube|vimeo)/i.test(absoluteUrl);
-        const isImage = /\.(jpe?g|png|gif|webp|svg)/i.test(absoluteUrl);
 
         mediaItems.push({
           type: getMediaType(absoluteUrl),
@@ -597,9 +669,26 @@ async function scrapeAllMediaFromPage() {
       try {
         const cssUrl = link.href;
         if (cssUrl) {
-          const response = await fetch(cssUrl);
-          if (response.ok) {
-            const cssText = await response.text();
+          let cssText;
+          try {
+            cssText = await new Promise((resolve, reject) => {
+              const xhr = new XMLHttpRequest();
+              xhr.open('GET', cssUrl);
+              xhr.onload = () => {
+                if (xhr.status === 200) {
+                  resolve(xhr.responseText);
+                } else {
+                  reject(new Error('Failed to load'));
+                }
+              };
+              xhr.onerror = () => reject(new Error('Network error'));
+              xhr.send();
+            });
+          } catch (e) {
+            console.log('Error fetching CSS with XHR:', e);
+            return;
+          }
+          if (cssText) {
             const urlRegex = /url\(["']?([^"']+)["']?\)/gi;
             let match;
             while ((match = urlRegex.exec(cssText)) !== null) {
@@ -630,7 +719,21 @@ async function scrapeAllMediaFromPage() {
 
   // Wait for all CSS fetches to complete
   await Promise.all(fetchPromises);
-
+  // Scrape from performance resources
+  const resources = performance.getEntriesByType('resource');
+  resources.forEach(resource => {
+    const url = resource.name;
+    if (url && !url.startsWith('data:') && !url.startsWith('blob:')) {
+      const type = getMediaType(url);
+      if (type !== 'other') {
+        mediaItems.push({
+          type: type,
+          url: url,
+          element: `Performance resource`
+        });
+      }
+    }
+  });
   // Remove duplicates
   const uniqueMediaItems = [];
   const seenUrls = new Set();

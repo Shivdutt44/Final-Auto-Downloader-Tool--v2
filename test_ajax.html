@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AJAX Media Test</title>
+</head>
+<body>
+    <h1>Test Page for AJAX Loaded Media</h1>
+    <div id="mediaContainer"></div>
+
+    <script>
+        // Load an image via AJAX (fetch)
+        async function loadImageViaAjax() {
+            try {
+                const response = await fetch('https://via.placeholder.com/300x200.png?text=AJAX+Image');
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                const img = document.createElement('img');
+                img.src = url;
+                img.alt = 'AJAX loaded image';
+                document.getElementById('mediaContainer').appendChild(img);
+            } catch (error) {
+                console.error('Error loading image:', error);
+            }
+        }
+
+        // Load a video via AJAX
+        async function loadVideoViaAjax() {
+            try {
+                // Note: For video, we can fetch the URL, but since it's a blob, it won't be in performance resources
+                // Instead, let's load a direct video URL via img for thumbnail or something
+                // But to test, perhaps load an image URL directly in fetch, but that won't add to performance if not requested as resource.
+
+                // Actually, to test performance resources, we need to make a request that gets logged.
+                // Fetching a URL will log it in performance.
+
+                const response = await fetch('https://sample-videos.com/zip/10/mp4/SampleVideo_1280x720_1mb.mp4');
+                // But this might not work due to CORS.
+
+                // Better: Load an image from a public URL via fetch, but since fetch is used, it should be in resources.
+
+                // Actually, fetch requests are logged in performance.getEntriesByType('resource') if they are for resources.
+
+                // But for simplicity, let's load an image directly in DOM after fetch.
+
+                // To properly test, let's make a fetch to an image URL, which will be a resource request.
+
+                await fetch('https://via.placeholder.com/400x300.jpg?text=AJAX+Fetched');
+
+                // Then, perhaps create an img with that URL.
+
+                const img = document.createElement('img');
+                img.src = 'https://via.placeholder.com/400x300.jpg?text=AJAX+Fetched';
+                img.alt = 'Fetched image';
+                document.getElementById('mediaContainer').appendChild(img);
+
+            } catch (error) {
+                console.error('Error loading video:', error);
+            }
+        }
+
+        // Load media on page load
+        window.addEventListener('load', () => {
+            loadImageViaAjax();
+            loadVideoViaAjax();
+        });
+    </script>
+</body>
+</html>

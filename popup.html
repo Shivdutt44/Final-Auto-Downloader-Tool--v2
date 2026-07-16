@@ -9,6 +9,7 @@
 <body>
   <header class="main-header">
     <h1><i class="fas fa-camera-retro"></i> Media Scraper <span class="premium-badge">PREMIUM</span></h1>
+    <button id="refreshBtn" class="refresh-btn"><i class="fas fa-sync-alt"></i> Refresh</button>
   </header>
   
   <div class="container">
@@ -20,6 +21,10 @@
       <div class="stat-card">
         <div class="stat-value" id="videoCount">0</div>
         <div class="stat-label">Videos</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="audioCount">0</div>
+        <div class="stat-label">Audio</div>
       </div>
       <div class="stat-card">
         <div class="stat-value" id="otherCount">0</div>
@@ -34,6 +39,7 @@
           <option value="all">All</option>
           <option value="image">Images</option>
           <option value="video">Videos</option>
+          <option value="audio">Audio</option>
           <option value="svg">SVG</option>
           <option value="data">Data URLs</option>
           <option value="other">Other</option>
@@ -45,6 +51,9 @@
           <option value="all">All</option>
           <!-- Will be populated dynamically -->
         </select>
+      </div>
+      <div class="filter-group">
+        <input type="text" id="searchFilter" placeholder="Search media...">
       </div>
     </div>
     
@@ -64,8 +73,8 @@
         <span id="selectedCount">0</span> Selected
       </button>
       <button id="downloadZipBtn" class="download-selected-btn" style="margin-left: 10px;">
-        <i class="fas fa-file-archive"></i>
-        Download as ZIP
+        <i class="fas fa-arrow-down"></i>
+        Download All
       </button>
     </div>
     
