@@ -3,7 +3,7 @@
   "name": "Auto Media Downloader",
   "version": "1.0",
   "description": "Automatically downloads all images and videos when extension is clicked",
-  "permissions": ["activeTab", "downloads", "scripting"],
+  "permissions": ["activeTab", "downloads", "scripting", "contextMenus"],
   "host_permissions": [
     "http://*/*",
     "https://*/*"
