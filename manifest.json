@@ -4,6 +4,10 @@
   "version": "1.0",
   "description": "Automatically downloads all images and videos when extension is clicked",
   "permissions": ["activeTab", "downloads", "scripting"],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
   "action": {
     "default_popup": "popup.html",
     "default_icon": {

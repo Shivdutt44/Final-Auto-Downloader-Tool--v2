@@ -196,7 +196,7 @@ document.addEventListener('DOMContentLoaded', function() {
   function showEmptyState() {
     mediaContainer.innerHTML = `
       <div class="empty-state">
-        <i class="fas fa-exclamation-circle"></i>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="var(--danger-color)" style="width: 40px; height: 40px; margin-bottom: 10px;"><path d="M256 512A256 256 0 1 0 256 0a256 256 0 1 0 0 512zm0-384c13.3 0 24 10.7 24 24V264c0 13.3-10.7 24-24 24s-24-10.7-24-24V152c0-13.3 10.7-24 24-24zm32 224a32 32 0 1 1-64 0 32 32 0 1 1 64 0z"/></svg>
         <p>No media found on this page</p>
         <p>Try a different website</p>
       </div>
@@ -261,7 +261,7 @@ document.addEventListener('DOMContentLoaded', function() {
       } else {
         const icon = document.createElement('div');
         icon.className = 'file-icon';
-        icon.innerHTML = `<i class="fas fa-file"></i>`;
+        icon.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512" fill="var(--primary-color)" style="width: 32px; height: 32px;"><path d="M0 64C0 28.7 28.7 0 64 0H224L384 160V448c0 35.3-28.7 64-64 64H64c-35.3 0-64-28.7-64-64V64zm224 0V160H352L224 64z"/></svg>`;
         card.appendChild(icon);
       }
       
@@ -320,11 +320,28 @@ document.addEventListener('DOMContentLoaded', function() {
     if (selectedItems.size === 0) return;
     
     const selectedMedia = filteredMediaData.filter(item => selectedItems.has(item.url));
+    let completed = 0;
+    const total = selectedMedia.length;
+    
+    progressBar.style.width = '0%';
+    progressPercent.textContent = '0%';
     
     // Download each selected item
     selectedMedia.forEach((item, index) => {
       setTimeout(() => {
-        downloadMedia(item);
+        downloadMedia(item, () => {
+          completed++;
+          const percent = Math.round((completed / total) * 100);
+          progressBar.style.width = `${percent}%`;
+          progressPercent.textContent = `${percent}%`;
+          
+          if (completed === total) {
+            setTimeout(() => {
+              progressBar.style.width = '0%';
+              progressPercent.textContent = '0%';
+            }, 3000);
+          }
+        });
       }, index * 300); // Stagger downloads to avoid issues
     });
     
@@ -341,36 +358,126 @@ document.addEventListener('DOMContentLoaded', function() {
     });
   });
   
+  // Helper to fetch media URL as blob with progress
+  async function fetchMediaAsBlob(url, onProgress) {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+    
+    const contentLength = response.headers.get('content-length');
+    if (!contentLength) {
+      return await response.blob();
+    }
+    
+    const total = parseInt(contentLength, 10);
+    let loaded = 0;
+    const reader = response.body.getReader();
+    const chunks = [];
+    
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      loaded += value.byteLength;
+      if (onProgress) {
+        onProgress(loaded / total);
+      }
+    }
+    
+    return new Blob(chunks);
+  }
+
   // Download selected items as ZIP
-  downloadZipBtn.addEventListener('click', () => {
+  downloadZipBtn.addEventListener('click', async () => {
     if (selectedItems.size === 0) return;
     
     const selectedMedia = filteredMediaData.filter(item => selectedItems.has(item.url));
-    const urls = selectedMedia.map(item => item.url);
-    const zipName = `media_archive_${new Date().toISOString().slice(0, 10)}.zip`;
+    const total = selectedMedia.length;
     
-    chrome.runtime.sendMessage({
-      action: 'downloadMultiple',
-      urls: urls,
-      zipName: zipName
-    }, (response) => {
-      if (response && response.progress) {
-        progressBar.style.width = `${response.progress}%`;
-        progressPercent.textContent = `${response.progress}%`;
+    progressBar.style.width = '0%';
+    progressPercent.textContent = '0% (Fetching...)';
+    
+    const zip = new JSZip();
+    let completed = 0;
+    const nameCount = {};
+    
+    for (let i = 0; i < total; i++) {
+      const item = selectedMedia[i];
+      try {
+        let filename = getFilename(item);
+        // Ensure unique filenames inside the zip
+        if (nameCount[filename]) {
+          const extIndex = filename.lastIndexOf('.');
+          if (extIndex !== -1) {
+            const name = filename.slice(0, extIndex);
+            const ext = filename.slice(extIndex);
+            filename = `${name}_${nameCount[filename]}${ext}`;
+          } else {
+            filename = `${filename}_${nameCount[filename]}`;
+          }
+          nameCount[filename]++;
+        } else {
+          nameCount[filename] = 1;
+        }
+
+        if (item.url.startsWith('data:')) {
+          const parts = item.url.split(',');
+          const isBase64 = parts[0].includes('base64');
+          const data = parts[1];
+          const content = isBase64 ? data : decodeURIComponent(data);
+          zip.file(filename, content, { base64: isBase64 });
+        } else {
+          const blob = await fetchMediaAsBlob(item.url, (percent) => {
+            const overallPercent = Math.round(((completed + percent) / total) * 100);
+            progressBar.style.width = `${overallPercent}%`;
+            progressPercent.textContent = `${overallPercent}% (Fetching...)`;
+          });
+          zip.file(filename, blob);
+        }
+      } catch (e) {
+        console.error('Failed to add file to ZIP:', item.url, e);
       }
-    });
+      completed++;
+      const overallPercent = Math.round((completed / total) * 100);
+      progressBar.style.width = `${overallPercent}%`;
+      progressPercent.textContent = `${overallPercent}% (Fetching...)`;
+    }
     
-    // Clear selection after download
-    selectedItems.clear();
-    updateSelectedCount();
+    progressPercent.textContent = 'Zipping...';
     
-    // Update UI to remove selection highlights
-    document.querySelectorAll('.media-card').forEach(card => {
-      card.classList.remove('selected');
-    });
-    document.querySelectorAll('.checkbox-select').forEach(checkbox => {
-      checkbox.checked = false;
-    });
+    try {
+      const zipBlob = await zip.generateAsync({ type: 'blob' }, (metadata) => {
+        const percent = Math.round(metadata.percent);
+        progressBar.style.width = `${percent}%`;
+        progressPercent.textContent = `${percent}% (Zipping...)`;
+      });
+      
+      const zipName = `media_archive_${new Date().toISOString().slice(0, 10)}.zip`;
+      const blobUrl = URL.createObjectURL(zipBlob);
+      
+      chrome.downloads.download({
+        url: blobUrl,
+        filename: zipName,
+        saveAs: true
+      }, () => {
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+        progressBar.style.width = '100%';
+        progressPercent.textContent = 'Completed!';
+        
+        // Clear selection
+        selectedItems.clear();
+        updateSelectedCount();
+        document.querySelectorAll('.media-card').forEach(card => card.classList.remove('selected'));
+        document.querySelectorAll('.checkbox-select').forEach(checkbox => checkbox.checked = false);
+        
+        setTimeout(() => {
+          progressBar.style.width = '0%';
+          progressPercent.textContent = '0%';
+        }, 3000);
+      });
+    } catch (err) {
+      console.error('ZIP generation failed:', err);
+      progressPercent.textContent = 'Failed to generate ZIP';
+    }
   });
   
   // Show preview modal
@@ -405,7 +512,7 @@ document.addEventListener('DOMContentLoaded', function() {
     } else {
       const icon = document.createElement('div');
       icon.className = 'file-icon-large';
-      icon.innerHTML = `<i class="fas fa-file"></i>`;
+      icon.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512" fill="var(--primary-color)" style="width: 64px; height: 64px;"><path d="M0 64C0 28.7 28.7 0 64 0H224L384 160V448c0 35.3-28.7 64-64 64H64c-35.3 0-64-28.7-64-64V64zm224 0V160H352L224 64z"/></svg>`;
       previewItem.appendChild(icon);
     }
     
@@ -436,16 +543,17 @@ document.addEventListener('DOMContentLoaded', function() {
   });
   
   // Download media function
-  function downloadMedia(mediaItem) {
-    chrome.runtime.sendMessage({
-      action: 'download',
+  function downloadMedia(mediaItem, callback) {
+    chrome.downloads.download({
       url: mediaItem.url,
-      filename: getFilename(mediaItem)
-    }, (response) => {
-      if (response && response.progress) {
-        progressBar.style.width = `${response.progress}%`;
-        progressPercent.textContent = `${response.progress}%`;
+      filename: getFilename(mediaItem),
+      saveAs: false,
+      conflictAction: 'uniquify'
+    }, (downloadId) => {
+      if (chrome.runtime.lastError) {
+        console.error('Download failed:', chrome.runtime.lastError);
       }
+      if (callback) callback();
     });
   }
   
