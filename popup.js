@@ -6,6 +6,8 @@ document.addEventListener('DOMContentLoaded', function() {
   const otherCountElement = document.getElementById('otherCount');
   const progressBar = document.getElementById('progressBar');
   const progressPercent = document.getElementById('progressPercent');
+  const progressContainer = document.getElementById('progressContainer');
+  const progressLabel = document.getElementById('progressLabel');
   const previewModal = document.getElementById('previewModal');
   const previewContent = document.getElementById('previewContent');
   const closeBtn = document.querySelector('.close-btn');
@@ -23,13 +25,18 @@ document.addEventListener('DOMContentLoaded', function() {
   let selectedItems = new Set();
   let fileExtensions = new Set();
   let filteredMediaData = [];
+  let autoScanInterval = null;
   
   // Auto-scrape when popup opens
-  autoScrapeMedia();
+  autoScrapeMedia().then(() => {
+    startAutoScan();
+  });
 
   // Refresh button
   refreshBtn.addEventListener('click', () => {
-    autoScrapeMedia();
+    autoScrapeMedia().then(() => {
+      startAutoScan();
+    });
   });
   
   async function autoScrapeMedia() {
@@ -82,6 +89,57 @@ document.addEventListener('DOMContentLoaded', function() {
     } catch (error) {
       console.error('Error scraping media:', error);
       showEmptyState();
+    }
+  }
+
+  // Start periodic live background scanning
+  function startAutoScan() {
+    if (autoScanInterval) clearInterval(autoScanInterval);
+    
+    autoScanInterval = setInterval(async () => {
+      if (typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.query && chrome.scripting) {
+        try {
+          const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+          if (!tab) return;
+          
+          // Silently execute scraper content script in the page
+          const result = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: scrapeAllMediaFromPage
+          });
+          
+          if (result && result[0] && result[0].result) {
+            integrateNewMedia(result[0].result);
+          }
+        } catch (e) {
+          console.warn('Background dynamic scan skipped / context detached:', e);
+        }
+      }
+    }, 1500);
+  }
+
+  // Safely integrate newly discovered media assets without breaking selection states
+  function integrateNewMedia(newMediaItems) {
+    let addedAny = false;
+    
+    newMediaItems.forEach(newItem => {
+      const exists = mediaData.some(item => item.url === newItem.url);
+      if (!exists) {
+        mediaData.push(newItem);
+        addedAny = true;
+      }
+    });
+    
+    if (addedAny) {
+      // Recalculate statistics
+      categorizeMedia(mediaData);
+      
+      // Update file filters
+      extractFileExtensions(mediaData);
+      updateExtensionFilter();
+      
+      // Re-apply filters to sync the display
+      applyFilters();
     }
   }
   
@@ -208,58 +266,73 @@ document.addEventListener('DOMContentLoaded', function() {
     `;
   }
   
-  // Function to update the media display
+  // Function to update the media display dynamically (performs incremental DOM reconciliation)
   function updateMediaDisplay(mediaItems) {
-    mediaContainer.innerHTML = '';
-
     if (mediaItems.length === 0) {
       showEmptyState();
       return;
     }
 
+    // Remove empty state / loading indicators if present
+    const empty = mediaContainer.querySelector('.empty-state');
+    if (empty) empty.remove();
+    const spinner = mediaContainer.querySelector('.loading-spinner');
+    if (spinner) spinner.remove();
 
-    let processed = 0;
-    const total = mediaItems.length;
+    // Map existing cards by URL to reuse them
+    const existingCards = new Map();
+    Array.from(mediaContainer.children).forEach(child => {
+      if (child.tagName === 'MEDIA-CARD-ELEMENT') {
+        existingCards.set(child.getAttribute('url'), child);
+      }
+    });
+
+    // Determine cards that should remain
+    const keepUrls = new Set(mediaItems.map(item => item.url));
+
+    // Remove cards for media that are no longer filtered/valid
+    existingCards.forEach((card, url) => {
+      if (!keepUrls.has(url)) {
+        card.remove();
+      }
+    });
 
     mediaItems.forEach((item, index) => {
-      const card = document.createElement('media-card-element');
-      card.setAttribute('url', item.url);
-      card.setAttribute('type', item.type);
-      if (selectedItems.has(item.url)) {
-        card.setAttribute('selected', '');
+      let card = existingCards.get(item.url);
+      if (!card) {
+        // Instantiate custom Web Component
+        card = document.createElement('media-card-element');
+        card.setAttribute('url', item.url);
+        card.setAttribute('type', item.type);
+        card.setAttribute('index', index);
+
+        card.addEventListener('toggle-select', (e) => {
+          const checked = e.detail.checked;
+          if (checked) {
+            selectedItems.add(item.url);
+            card.setAttribute('selected', '');
+          } else {
+            selectedItems.delete(item.url);
+            card.removeAttribute('selected');
+          }
+          updateSelectedCount();
+        });
+
+        card.addEventListener('preview-media', () => {
+          showPreview(parseInt(card.getAttribute('index')));
+        });
+
+        mediaContainer.appendChild(card);
+      } else {
+        // Update index attribute directly
+        card.setAttribute('index', index);
       }
 
-      card.addEventListener('toggle-select', (e) => {
-        const checked = e.detail.checked;
-        if (checked) {
-          selectedItems.add(item.url);
-          card.setAttribute('selected', '');
-        } else {
-          selectedItems.delete(item.url);
-          card.removeAttribute('selected');
-        }
-        updateSelectedCount();
-      });
-
-      card.addEventListener('preview-media', () => {
-        showPreview(index);
-      });
-
-      card.addEventListener('media-loaded', () => {
-        updateProgress();
-      });
-
-      card.addEventListener('media-error', () => {
-        updateProgress();
-      });
-
-      mediaContainer.appendChild(card);
-      
-      function updateProgress() {
-        processed++;
-        const percent = Math.round((processed / total) * 100);
-        progressBar.style.width = `${percent}%`;
-        progressPercent.textContent = `${percent}%`;
+      // Synchronize selection state
+      if (selectedItems.has(item.url)) {
+        card.setAttribute('selected', '');
+      } else {
+        card.removeAttribute('selected');
       }
     });
   }
@@ -296,6 +369,8 @@ document.addEventListener('DOMContentLoaded', function() {
     let completed = 0;
     const total = selectedMedia.length;
     
+    if (progressContainer) progressContainer.classList.remove('hidden');
+    if (progressLabel) progressLabel.textContent = 'Download Progress';
     progressBar.style.width = '0%';
     progressPercent.textContent = '0%';
     
@@ -312,6 +387,7 @@ document.addEventListener('DOMContentLoaded', function() {
             setTimeout(() => {
               progressBar.style.width = '0%';
               progressPercent.textContent = '0%';
+              if (progressContainer) progressContainer.classList.add('hidden');
             }, 3000);
           }
         });
@@ -366,6 +442,8 @@ document.addEventListener('DOMContentLoaded', function() {
     const selectedMedia = filteredMediaData.filter(item => selectedItems.has(item.url));
     const total = selectedMedia.length;
     
+    if (progressContainer) progressContainer.classList.remove('hidden');
+    if (progressLabel) progressLabel.textContent = 'ZIP Export Progress';
     progressBar.style.width = '0%';
     progressPercent.textContent = '0% (Fetching...)';
     
@@ -392,14 +470,16 @@ document.addEventListener('DOMContentLoaded', function() {
           nameCount[filename] = 1;
         }
 
-        if (item.url.startsWith('data:')) {
-          const parts = item.url.split(',');
+        const resolvedUrl = await resolveDownloadUrl(item);
+
+        if (resolvedUrl.startsWith('data:')) {
+          const parts = resolvedUrl.split(',');
           const isBase64 = parts[0].includes('base64');
           const data = parts[1];
           const content = isBase64 ? data : decodeURIComponent(data);
           zip.file(filename, content, { base64: isBase64 });
         } else {
-          const blob = await fetchMediaAsBlob(item.url, (percent) => {
+          const blob = await fetchMediaAsBlob(resolvedUrl, (percent) => {
             const overallPercent = Math.round(((completed + percent) / total) * 100);
             progressBar.style.width = `${overallPercent}%`;
             progressPercent.textContent = `${overallPercent}% (Fetching...)`;
@@ -445,6 +525,7 @@ document.addEventListener('DOMContentLoaded', function() {
         setTimeout(() => {
           progressBar.style.width = '0%';
           progressPercent.textContent = '0%';
+          if (progressContainer) progressContainer.classList.add('hidden');
         }, 3000);
       });
     } catch (err) {
@@ -454,30 +535,45 @@ document.addEventListener('DOMContentLoaded', function() {
   });
   
   // Show preview modal
-  function showPreview(index) {
+  async function showPreview(index) {
     currentPreviewIndex = index;
     previewContent.innerHTML = '';
-    
+
     const item = filteredMediaData[index];
     const previewItem = document.createElement('div');
     previewItem.className = 'preview-item';
-    
+
+    // blob: URLs belong to the source tab's document and can't be loaded directly
+    // inside the popup - resolve them to a data URL first.
+    const isBlob = item.url && item.url.startsWith('blob:');
+    let playableUrl = item.url;
+    if (isBlob && (item.type === 'video' || item.type === 'image' || item.type === 'audio')) {
+      const loading = document.createElement('div');
+      loading.className = 'file-icon-large';
+      loading.textContent = 'Loading preview...';
+      previewItem.appendChild(loading);
+      previewContent.appendChild(previewItem);
+      previewModal.classList.add('active');
+      playableUrl = await resolveDownloadUrl(item);
+      loading.remove();
+    }
+
     if (item.type === 'image') {
       const img = document.createElement('img');
-      img.src = item.url;
+      img.src = playableUrl;
       img.alt = 'Preview image';
       img.onerror = () => previewItem.remove();
       previewItem.appendChild(img);
     } else if (item.type === 'video') {
       const video = document.createElement('video');
-      video.src = item.url;
+      video.src = playableUrl;
       video.controls = true;
       video.autoplay = true;
       video.onerror = () => previewItem.remove();
       previewItem.appendChild(video);
     } else if (item.type === 'audio') {
       const audio = document.createElement('audio');
-      audio.src = item.url;
+      audio.src = playableUrl;
       audio.controls = true;
       audio.autoplay = true;
       audio.onerror = () => previewItem.remove();
@@ -515,10 +611,40 @@ document.addEventListener('DOMContentLoaded', function() {
     }
   });
   
+  // Blob URLs are scoped to the tab's document that created them - they can't be
+  // resolved from the popup/background context, so fetch+convert them inside the tab.
+  async function resolveDownloadUrl(mediaItem) {
+    if (!mediaItem.url || !mediaItem.url.startsWith('blob:')) {
+      return mediaItem.url;
+    }
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const result = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: async (blobUrl) => {
+          const response = await fetch(blobUrl);
+          const blob = await response.blob();
+          return await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.onerror = () => reject(reader.error);
+            reader.readAsDataURL(blob);
+          });
+        },
+        args: [mediaItem.url]
+      });
+      return (result && result[0] && result[0].result) || mediaItem.url;
+    } catch (e) {
+      console.error('Failed to resolve blob URL:', e);
+      return mediaItem.url;
+    }
+  }
+
   // Download media function
-  function downloadMedia(mediaItem, callback) {
+  async function downloadMedia(mediaItem, callback) {
+    const downloadUrl = await resolveDownloadUrl(mediaItem);
     chrome.downloads.download({
-      url: mediaItem.url,
+      url: downloadUrl,
       filename: getFilename(mediaItem),
       saveAs: false,
       conflictAction: 'uniquify'
@@ -680,12 +806,22 @@ async function scrapeAllMediaFromPage() {
 
   const allElements = getAllElements();
 
+  // Helper to unescape JSON Unicode escapes and backslashes
+  function unescapeUrl(url) {
+    if (!url || typeof url !== 'string') return url;
+    return url
+      .replace(/\\u([0-9a-fA-F]{4})/g, (_, grp) => String.fromCharCode(parseInt(grp, 16)))
+      .replace(/\\/g, '')
+      .trim();
+  }
+
   // Helper to add media items with safety checks
   function addMediaItem(url, sourceElement, typeOverride = null) {
     if (!url || typeof url !== 'string') return;
     
-    // Clean and convert to original high resolution URL
-    let cleanUrl = getHighResUrl(url.trim());
+    // Clean, unescape backslashes, and convert to original high resolution URL
+    let cleanUrl = unescapeUrl(url);
+    cleanUrl = getHighResUrl(cleanUrl);
     if (!cleanUrl) return;
     
     // Skip tiny trackers / spacer GIFs / base64 of inline symbols (except valid SVGs)
@@ -717,10 +853,15 @@ async function scrapeAllMediaFromPage() {
   function scanTextForUrls(text, sourceDesc) {
     if (!text || typeof text !== 'string') return;
     
+    // Unescape backslashes first so we can parse standard URL strings cleanly
+    const cleanText = text
+      .replace(/\\u([0-9a-fA-F]{4})/g, (_, grp) => String.fromCharCode(parseInt(grp, 16)))
+      .replace(/\\/g, '');
+    
     // Matches http/https URLs or relative paths starting with /
     const urlRegex = /(https?:\/\/[^\s"'()<>]+|href=["']?([^\s"'()<>]+)|src=["']?([^\s"'()<>]+)|url\(["']?([^\s"'()<>]+)["']?\))/gi;
     let match;
-    while ((match = urlRegex.exec(text)) !== null) {
+    while ((match = urlRegex.exec(cleanText)) !== null) {
       let foundUrl = match[1];
       if (foundUrl.startsWith('url(')) {
         foundUrl = foundUrl.substring(4, foundUrl.length - 1).replace(/["']/g, '');
@@ -743,8 +884,17 @@ async function scrapeAllMediaFromPage() {
       // Check standard tags
       if (tagName === 'IMG') {
         addMediaItem(element.src || element.getAttribute('src'), element);
+        const srcset = element.getAttribute('srcset');
+        if (srcset) {
+          srcset.split(',').forEach(item => {
+            const parts = item.trim().split(/\s+/);
+            if (parts[0]) addMediaItem(parts[0], element);
+          });
+        }
       } else if (tagName === 'VIDEO') {
-        addMediaItem(element.src || element.getAttribute('src'), element);
+        // Force 'video' type override since blob: src URLs (common on Instagram/Facebook
+        // players) have no file extension for getMediaType() to infer from.
+        addMediaItem(element.src || element.getAttribute('src'), element, 'video');
         // Check video sources
         element.querySelectorAll('source').forEach(source => {
           addMediaItem(source.src || source.getAttribute('src'), element, 'video');
@@ -754,7 +904,7 @@ async function scrapeAllMediaFromPage() {
           addMediaItem(element.poster, element, 'image');
         }
       } else if (tagName === 'AUDIO') {
-        addMediaItem(element.src || element.getAttribute('src'), element);
+        addMediaItem(element.src || element.getAttribute('src'), element, 'audio');
         element.querySelectorAll('source').forEach(source => {
           addMediaItem(source.src || source.getAttribute('src'), element, 'audio');
         });
@@ -780,11 +930,7 @@ async function scrapeAllMediaFromPage() {
             if (parts[0]) addMediaItem(parts[0], element);
           });
         }
-      } else if (tagName === 'SVG' || tagName === 'IMAGE') {
-        if (tagName === 'SVG') {
-          const svgData = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(element.outerHTML);
-          addMediaItem(svgData, element, 'image');
-        }
+      } else if (tagName === 'IMAGE') {
         const href = element.getAttribute('href') || element.getAttribute('xlink:href');
         if (href) addMediaItem(href, element);
       } else if (tagName === 'EMBED' || tagName === 'OBJECT') {
@@ -806,7 +952,8 @@ async function scrapeAllMediaFromPage() {
       // 4. Universal Attribute Scanner (inspected for media extensions/URLs)
       for (let i = 0; i < element.attributes.length; i++) {
         const attr = element.attributes[i];
-        const value = attr.value.trim();
+        if (!attr.value || typeof attr.value !== 'string') continue;
+        const value = unescapeUrl(attr.value);
         if (!value) continue;
         
         // Skip standard attributes that are already processed or are not URLs
@@ -835,10 +982,21 @@ async function scrapeAllMediaFromPage() {
     }
   });
 
-  // 5. Parse inline <style> tags
+  // 5. Parse inline <style> tags for background images
   document.querySelectorAll('style').forEach(styleTag => {
     try {
-      scanTextForUrls(styleTag.textContent, 'Inline <style> tag');
+      if (styleTag.textContent) {
+        scanTextForUrls(styleTag.textContent, 'Inline <style> tag');
+      }
+    } catch (e) {}
+  });
+
+  // 5.5. Parse inline <script> tags for raw JSON data/URLs (crucial for React/Relay state on Instagram/Facebook)
+  document.querySelectorAll('script').forEach(scriptTag => {
+    try {
+      if (scriptTag.textContent) {
+        scanTextForUrls(scriptTag.textContent, 'Inline <script> tag');
+      }
     } catch (e) {}
   });
 
@@ -869,6 +1027,23 @@ async function scrapeAllMediaFromPage() {
       findUrlsRecursive(json);
     } catch (e) {}
   });
+
+  // 6.5. Scrape OpenGraph and Twitter Card meta headers (stores high-res original posts media)
+  try {
+    document.querySelectorAll('meta').forEach(meta => {
+      let content = meta.getAttribute('content');
+      const property = meta.getAttribute('property') || meta.getAttribute('name') || '';
+      if (content && typeof content === 'string') {
+        content = unescapeUrl(content);
+        if (content.startsWith('http') || content.startsWith('//')) {
+          if (property.includes('image') || property.includes('video') || property.includes('media')) {
+            const type = property.includes('video') ? 'video' : 'image';
+            addMediaItem(content, `Meta Header (${property})`, type);
+          }
+        }
+      }
+    });
+  } catch (e) {}
 
   // 7. Parse external stylesheets via link tags
   const stylesheets = document.querySelectorAll('link[rel="stylesheet"]');
@@ -988,6 +1163,36 @@ class MediaCardElement extends HTMLElement {
         object-fit: cover;
         display: block;
       }
+      .video-wrapper {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        background-color: #000;
+      }
+      .video-overlay {
+        position: absolute;
+        top: 0; left: 0; right: 0; bottom: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0, 0, 0, 0.25);
+        transition: background 0.2s ease;
+      }
+      :host(:hover) .video-overlay {
+        background: rgba(0, 0, 0, 0.45);
+      }
+      .video-overlay svg {
+        width: 32px;
+        height: 32px;
+        fill: white;
+        opacity: 0.85;
+        filter: drop-shadow(0 2px 4px rgba(0,0,0,0.4));
+        transition: transform 0.2s ease, opacity 0.2s ease;
+      }
+      :host(:hover) .video-overlay svg {
+        transform: scale(1.15);
+        opacity: 1;
+      }
       .file-icon {
         width: 100%;
         height: 100%;
@@ -1047,15 +1252,30 @@ class MediaCardElement extends HTMLElement {
       }
     `;
 
+    // blob: URLs belong to the source tab's document - they can never load inside
+    // the popup's own document, so show a placeholder icon instead of a dead <img>/<video>.
+    const isBlob = url.startsWith('blob:');
+
     let contentHtml = '';
-    if (type === 'image') {
-      contentHtml = `<img src="${url}" alt="Media Image" loading="lazy">`;
-    } else if (type === 'video') {
-      contentHtml = `<video src="${url}" preload="metadata" muted></video>`;
+    if (type === 'image' && !isBlob) {
+      contentHtml = `<img src="${url}" alt="Media Image">`;
+    } else if (type === 'video' && !isBlob) {
+      contentHtml = `
+        <div class="video-wrapper">
+          <video src="${url}" preload="metadata" muted></video>
+          <div class="video-overlay">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+              <path d="M504 256C504 119 393 8 256 8S8 119 8 256s111 248 248 248 248-111 248-248zM192 144c0-13.3 14.3-22.3 25.4-15l176 112c9.7 6.2 9.7 20.8 0 27l-176 112c-11.1 7.3-25.4-1.7-25.4-15V144z"/>
+            </svg>
+          </div>
+        </div>
+      `;
     } else {
       let iconSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512" fill="currentColor" style="width: 28px; height: 28px;"><path d="M0 64C0 28.7 28.7 0 64 0H224L384 160V448c0 35.3-28.7 64-64 64H64c-35.3 0-64-28.7-64-64V64zm224 0V160H352L224 64z"/></svg>`;
       if (type === 'audio') {
         iconSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512" fill="currentColor" style="width: 28px; height: 28px;"><path d="M192 0C86 0 0 86 0 192c0 77.4 46.2 144 112 173v47c0 17.7 14.3 32 32 32h16c17.7 0 32-14.3 32-32v-16h32v16c0 17.7 14.3 32 32 32h16c17.7 0 32-14.3 32-32v-47c65.8-29 112-95.6 112-173C384 86 298 0 192 0z"/></svg>`;
+      } else if (type === 'video') {
+        iconSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="currentColor" style="width: 28px; height: 28px;"><path d="M0 96C0 60.7 28.7 32 64 32H320c35.3 0 64 28.7 64 64V416c0 35.3-28.7 64-64 64H64c-35.3 0-64-28.7-64-64V96zM559.1 99.8c10.4 5.6 16.9 16.4 16.9 28.2V384c0 11.8-6.5 22.6-16.9 28.2s-23 5-32.9-1.6l-96-64L416 337.1V320 192 174.9l14.2-9.5 96-64c9.8-6.6 22.4-7.2 32.9-1.6z"/></svg>`;
       }
       contentHtml = `<div class="file-icon">${iconSvg}</div>`;
     }
