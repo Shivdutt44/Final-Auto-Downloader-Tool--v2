@@ -22,12 +22,13 @@ document.addEventListener('DOMContentLoaded', function() {
   const statCards = document.querySelectorAll('.stat-card[data-type]');
 
   let mediaData = [];
-  let currentPreviewIndex = 0;
   let selectedItems = new Set();
   let fileExtensions = new Set();
   let filteredMediaData = [];
   let autoScanInterval = null;
   let activeTabId = null;
+  let lastRecordingError = null; // why the last in-tab recording didn't happen (shown on failure)
+  const brokenUrls = new Set(); // items whose card failed to load - excluded from list and counts
   const loadMoreBtn = document.getElementById('loadMoreBtn');
   
   // Auto-scrape when popup opens
@@ -44,17 +45,27 @@ document.addEventListener('DOMContentLoaded', function() {
 
   // Dynamically scroll the page to force YouTube / Reels infinite-load
   if (loadMoreBtn) {
+    // Keep the original markup (SVG icon + label) so it can be restored exactly -
+    // setting textContent would wipe the icon.
+    const loadMoreOriginalHtml = loadMoreBtn.innerHTML;
+    const resetLoadMoreBtn = (html = loadMoreOriginalHtml) => {
+      loadMoreBtn.innerHTML = html;
+      loadMoreBtn.disabled = false;
+      loadMoreBtn.classList.remove('loading');
+    };
+
     loadMoreBtn.addEventListener('click', async () => {
       if (typeof chrome === 'undefined' || !chrome.tabs || !chrome.scripting) return;
       try {
         loadMoreBtn.disabled = true;
         loadMoreBtn.classList.add('loading');
-        const originalText = loadMoreBtn.dataset.label || loadMoreBtn.textContent;
-        loadMoreBtn.dataset.label = originalText;
         loadMoreBtn.textContent = 'Loading feed...';
 
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (!tab?.id) return;
+        if (!tab?.id) {
+          resetLoadMoreBtn();
+          return;
+        }
         activeTabId = tab.id;
 
         await ensureDynamicLoader(tab.id);
@@ -77,7 +88,8 @@ document.addEventListener('DOMContentLoaded', function() {
         // Re-scrape after scroll loads new items
         const result = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
-          func: scrapeAllMediaFromPage
+          func: scrapeAllMediaFromPage,
+          args: [true]
         });
         if (result?.[0]?.result) {
           integrateNewMedia(result[0].result);
@@ -85,16 +97,11 @@ document.addEventListener('DOMContentLoaded', function() {
         }
 
         loadMoreBtn.textContent = 'Loaded ✓';
-        setTimeout(() => {
-          loadMoreBtn.textContent = loadMoreBtn.dataset.label || 'Load More Videos';
-          loadMoreBtn.disabled = false;
-          loadMoreBtn.classList.remove('loading');
-        }, 1200);
+        setTimeout(() => resetLoadMoreBtn(), 1200);
       } catch (e) {
         console.error('Load more failed:', e);
-        loadMoreBtn.textContent = 'Retry Load More';
-        loadMoreBtn.disabled = false;
-        loadMoreBtn.classList.remove('loading');
+        resetLoadMoreBtn();
+        loadMoreBtn.title = 'Last attempt failed - click to retry';
       }
     });
   }
@@ -115,34 +122,61 @@ document.addEventListener('DOMContentLoaded', function() {
           if (window.__AMD_MAIN_HOOKS__) return;
           window.__AMD_MAIN_HOOKS__ = true;
 
+          // Video id of what this tab is showing *right now* (URL changes on SPA nav)
+          const currentPageVideoId = () => {
+            try {
+              return new URLSearchParams(location.search).get('v') ||
+                (location.pathname.match(/\/shorts\/([a-zA-Z0-9_-]{11})/) || [])[1] || null;
+            } catch (_) { return null; }
+          };
+
+          // Every stream is stored together with the video it belongs to, so a stream
+          // from a previous SPA page can never be attributed to the current video.
           const pushStream = (url, meta) => {
             if (!url) return;
+            const videoId = meta?.videoId || null;
             try {
               window.dispatchEvent(new CustomEvent('amd-media-found', {
-                detail: { url, streamUrl: url, type: 'video', source: 'main-world', ...(meta || {}) }
+                detail: { url, streamUrl: url, type: 'video', source: 'main-world', ...(meta || {}), videoId }
               }));
             } catch (_) {}
-            // Also stash on document for isolated world polling
+            // Also stash on document for isolated world polling: [{ url, videoId }]
             try {
               const node = document.documentElement;
               const prev = node.getAttribute('data-amd-streams') || '[]';
               let list = [];
               try { list = JSON.parse(prev); } catch (_) { list = []; }
-              if (!list.includes(url)) {
-                list.push(url);
+              if (!Array.isArray(list)) list = [];
+              list = list.filter(e => e && typeof e === 'object' && e.url);
+              if (!list.some(e => e.url === url)) {
+                list.push({ url, videoId });
                 if (list.length > 40) list = list.slice(-40);
                 node.setAttribute('data-amd-streams', JSON.stringify(list));
-              }
-              if (meta?.videoId) {
-                node.setAttribute('data-amd-vid', meta.videoId);
               }
             } catch (_) {}
           };
 
+          // ytInitialPlayerResponse is only set on the first full page load and goes
+          // stale after SPA navigation, so prefer the live player's own response and
+          // only accept a response whose videoId matches the page currently shown.
+          const currentPlayerResponse = () => {
+            const pageId = currentPageVideoId();
+            const candidates = [];
+            try {
+              const player = document.querySelector('#movie_player');
+              if (player && typeof player.getPlayerResponse === 'function') {
+                candidates.push(player.getPlayerResponse());
+              }
+            } catch (_) {}
+            candidates.push(window.ytInitialPlayerResponse);
+            return candidates.find(pr => pr?.streamingData && pr.videoDetails?.videoId &&
+              (!pageId || pr.videoDetails.videoId === pageId)) || null;
+          };
+
           const harvestPlayer = () => {
             try {
-              const pr = window.ytInitialPlayerResponse;
-              if (!pr?.streamingData) return;
+              const pr = currentPlayerResponse();
+              if (!pr) return;
               const videoId = pr.videoDetails?.videoId;
               const title = pr.videoDetails?.title;
               const formats = [
@@ -185,14 +219,34 @@ document.addEventListener('DOMContentLoaded', function() {
                 const input = arguments[0];
                 const u = typeof input === 'string' ? input : (input && input.url);
                 if (u && /googlevideo\.com\/videoplayback/i.test(u)) {
-                  pushStream(u, { source: 'fetch' });
+                  pushStream(u, { source: 'fetch', videoId: currentPageVideoId() });
                 }
               } catch (_) {}
               return p;
             };
           }
 
-          window.addEventListener('yt-navigate-finish', () => setTimeout(harvestPlayer, 500));
+          // SPA navigation hooks have to live in the MAIN world - patching
+          // history.pushState from the isolated world never sees the page's own calls.
+          // The DOM event crosses worlds, so dynamic-loader.js listens for it.
+          const signalNav = () => {
+            try { window.dispatchEvent(new CustomEvent('amd-navigate')); } catch (_) {}
+            setTimeout(harvestPlayer, 500);
+          };
+          ['pushState', 'replaceState'].forEach((fn) => {
+            const orig = history[fn];
+            if (typeof orig !== 'function') return;
+            history[fn] = function () {
+              const r = orig.apply(this, arguments);
+              signalNav();
+              return r;
+            };
+          });
+          window.addEventListener('popstate', signalNav);
+          // YouTube fires this on an element and it bubbles; listen at both levels
+          // (a duplicate signal only triggers a harmless extra rescan).
+          document.addEventListener('yt-navigate-finish', signalNav);
+          window.addEventListener('yt-navigate-finish', signalNav);
         }
       });
     } catch (e) {
@@ -210,6 +264,7 @@ document.addEventListener('DOMContentLoaded', function() {
       
       imageCountElement.textContent = '0';
       videoCountElement.textContent = '0';
+      audioCountElement.textContent = '0';
       otherCountElement.textContent = '0';
       progressBar.style.width = '0%';
       progressPercent.textContent = '0%';
@@ -228,10 +283,11 @@ document.addEventListener('DOMContentLoaded', function() {
         // Install persistent dynamic loader (YouTube/Shorts/Reels infinite scroll)
         await ensureDynamicLoader(tab.id);
         
-        // Execute content script to scrape media
+        // Execute content script to scrape media (full scan, not incremental)
         const result = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
-          func: scrapeAllMediaFromPage
+          func: scrapeAllMediaFromPage,
+          args: [false]
         });
         
         if (result && result[0] && result[0].result) {
@@ -264,36 +320,47 @@ document.addEventListener('DOMContentLoaded', function() {
     }
   }
 
-  // Start periodic live background scanning
+  // Start periodic live background scanning.
+  // Uses a self-rescheduling timeout (not setInterval) so a slow scan on a heavy page
+  // can never overlap with the next one, and runs the scraper in incremental mode so
+  // stylesheets / inline scripts / computed styles already processed aren't redone.
+  const AUTO_SCAN_DELAY_MS = 2500;
+  let autoScanGeneration = 0;
   function startAutoScan() {
-    if (autoScanInterval) clearInterval(autoScanInterval);
-    
-    autoScanInterval = setInterval(async () => {
+    if (autoScanInterval) clearTimeout(autoScanInterval);
+    const generation = ++autoScanGeneration;
+
+    const tick = async () => {
+      if (generation !== autoScanGeneration) return; // superseded by a newer startAutoScan
       if (typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.query && chrome.scripting) {
         try {
           const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-          if (!tab?.id) return;
-          activeTabId = tab.id;
+          if (tab?.id) {
+            activeTabId = tab.id;
 
-          // Keep dynamic loader alive across SPA navigations
-          await ensureDynamicLoader(tab.id);
-          
-          // Silently execute scraper content script in the page
-          const result = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            func: scrapeAllMediaFromPage
-          });
-          
-          if (result && result[0] && result[0].result) {
-            integrateNewMedia(result[0].result);
-            // Also merge stream URLs from cache
-            await mergeCacheStreamsIntoTab(tab.id);
+            // Keep dynamic loader alive across full page navigations (guarded, cheap if present)
+            await ensureDynamicLoader(tab.id);
+
+            const result = await chrome.scripting.executeScript({
+              target: { tabId: tab.id },
+              func: scrapeAllMediaFromPage,
+              args: [true]
+            });
+
+            if (generation === autoScanGeneration && result && result[0] && result[0].result) {
+              integrateNewMedia(result[0].result);
+              await mergeCacheStreamsIntoTab(tab.id);
+            }
           }
         } catch (e) {
           console.warn('Background dynamic scan skipped / context detached:', e);
         }
       }
-    }, 1500);
+      if (generation === autoScanGeneration) {
+        autoScanInterval = setTimeout(tick, AUTO_SCAN_DELAY_MS);
+      }
+    };
+    autoScanInterval = setTimeout(tick, AUTO_SCAN_DELAY_MS);
   }
 
   // Read stream URLs from dynamic-loader cache and merge into mediaData
@@ -312,7 +379,9 @@ document.addEventListener('DOMContentLoaded', function() {
             .filter(m => m.streamUrl || m.videoId)
             .map(m => ({
               type: m.type || 'video',
-              url: m.streamUrl || m.url,
+              // Same identity rule as the scraper: watch URL when known, so the
+              // item matches/dedupes with scraped entries and never changes later
+              url: (m.videoId && m.watchUrl) || m.streamUrl || m.url,
               watchUrl: m.watchUrl || null,
               streamUrl: m.streamUrl || null,
               thumbnail: m.thumbnail || null,
@@ -337,10 +406,11 @@ document.addEventListener('DOMContentLoaded', function() {
             (cacheItem.watchUrl && m.url === cacheItem.watchUrl)
           );
           if (match) {
-            // Enrich existing item with stream URL if missing
+            // Enrich existing item with stream URL if missing. `url` is deliberately
+            // left untouched - it's the stable key for selection state and cards;
+            // downloads already prefer `streamUrl` (see resolveDownloadUrl).
             if (cacheItem.streamUrl && !match.streamUrl) {
               match.streamUrl = cacheItem.streamUrl;
-              match.url = cacheItem.streamUrl; // Update primary URL to stream
               merged = true;
             }
             if (cacheItem.thumbnail && !match.thumbnail) {
@@ -369,24 +439,30 @@ document.addEventListener('DOMContentLoaded', function() {
     let addedAny = false;
     
     newMediaItems.forEach(newItem => {
-      // Deduplicate by url OR youtube videoId
-      const exists = mediaData.some(item => {
-        if (item.url === newItem.url) return true;
-        if (newItem.videoId && item.videoId && item.videoId === newItem.videoId) {
-          // Upgrade existing entry if new one has a real stream URL
-          if (newItem.streamUrl && !item.streamUrl) {
-            Object.assign(item, newItem);
-            addedAny = true;
-          } else if (newItem.thumbnail && !item.thumbnail) {
-            item.thumbnail = newItem.thumbnail;
-          }
-          return true;
-        }
-        return false;
-      });
-      if (!exists) {
+      // Deduplicate by url OR youtube videoId. A YouTube item's url is its stable
+      // watch URL, so the same video usually matches by url - the upgrade below
+      // must run for both kinds of match, or a newly found stream is never kept.
+      const existing = mediaData.find(item =>
+        item.url === newItem.url ||
+        (newItem.videoId && item.videoId && item.videoId === newItem.videoId)
+      );
+      if (!existing) {
         mediaData.push(newItem);
         addedAny = true;
+        return;
+      }
+      // Upgrade with a real stream URL - but keep the original `url`, which
+      // selection state and the rendered card are keyed by.
+      if (newItem.streamUrl && !existing.streamUrl) {
+        const stableUrl = existing.url;
+        const stableTitle = existing.title;
+        Object.assign(existing, newItem);
+        existing.url = stableUrl;
+        existing.title = existing.title || stableTitle;
+        addedAny = true;
+      } else {
+        if (newItem.thumbnail && !existing.thumbnail) existing.thumbnail = newItem.thumbnail;
+        if (newItem.title && !existing.title) existing.title = newItem.title;
       }
     });
     
@@ -411,6 +487,7 @@ document.addEventListener('DOMContentLoaded', function() {
     let other = 0;
 
     mediaItems.forEach(item => {
+      if (brokenUrls.has(item.url)) return;
       if (item.type === 'image') images++;
       else if (item.type === 'video') videos++;
       else if (item.type === 'audio') audio++;
@@ -469,6 +546,7 @@ document.addEventListener('DOMContentLoaded', function() {
     const searchValue = searchFilter.value.toLowerCase();
 
     filteredMediaData = mediaData.filter(item => {
+      if (brokenUrls.has(item.url)) return false;
       // Filter by type
       if (typeValue !== 'all') {
         if (typeValue === 'svg') {
@@ -621,21 +699,33 @@ document.addEventListener('DOMContentLoaded', function() {
           updateSelectedCount();
         });
 
+        // Media that can't load (404, blocked, not really media) is dropped from
+        // the list and the stat counters instead of lingering as a hidden card
+        card.addEventListener('media-error', () => {
+          brokenUrls.add(item.url);
+          selectedItems.delete(item.url);
+          updateSelectedCount();
+          card.remove();
+          categorizeMedia(mediaData);
+        });
+
         card.addEventListener('preview-media', () => {
           showPreview(parseInt(card.getAttribute('index')));
         });
 
         card.addEventListener('download-media', () => {
           const current = filteredMediaData[parseInt(card.getAttribute('index'))];
-          if (current) downloadMedia(current);
+          if (current) downloadMedia(current).catch(e => console.error('Download failed:', e));
         });
 
         mediaContainer.appendChild(card);
       } else {
-        // Update index attribute directly
+        // Update index attribute directly, plus details discovered after the card
+        // was first created (title / stream / thumbnail arrive on later scans)
         card.setAttribute('index', index);
         if (item.thumbnail) card.setAttribute('thumbnail', item.thumbnail);
         if (item.streamUrl) card.setAttribute('stream-url', item.streamUrl);
+        if (item.title && card.getAttribute('title') !== item.title) card.setAttribute('title', item.title);
       }
 
       // Synchronize selection state
@@ -645,18 +735,6 @@ document.addEventListener('DOMContentLoaded', function() {
         card.removeAttribute('selected');
       }
     });
-  }
-  
-  // Toggle selection of media item
-  function toggleSelection(url, checkbox, card) {
-    if (checkbox.checked) {
-      selectedItems.add(url);
-      card.classList.add('selected');
-    } else {
-      selectedItems.delete(url);
-      card.classList.remove('selected');
-    }
-    updateSelectedCount();
   }
   
   // Update selected count in sticky download button
@@ -671,11 +749,28 @@ document.addEventListener('DOMContentLoaded', function() {
     }
   }
   
+  // Clear selection both in state and on the cards. The checkbox lives inside each
+  // card's Shadow DOM, so document.querySelectorAll('.checkbox-select') can't reach
+  // it - removing the host's `selected` attribute re-renders the card unchecked.
+  function clearSelection() {
+    selectedItems.clear();
+    updateSelectedCount();
+    mediaContainer.querySelectorAll('media-card-element[selected]').forEach(card => {
+      card.removeAttribute('selected');
+    });
+  }
+
+  // Selected items are looked up in the full list (not just the filtered view) so
+  // that items hidden by a later filter change still get downloaded.
+  function getSelectedMedia() {
+    return mediaData.filter(item => selectedItems.has(item.url));
+  }
+
   // Download selected items individually
   downloadSelectedBtn.addEventListener('click', () => {
     if (selectedItems.size === 0) return;
-    
-    const selectedMedia = filteredMediaData.filter(item => selectedItems.has(item.url));
+
+    const selectedMedia = getSelectedMedia();
     let completed = 0;
     const total = selectedMedia.length;
     
@@ -687,7 +782,12 @@ document.addEventListener('DOMContentLoaded', function() {
     // Download each selected item
     selectedMedia.forEach((item, index) => {
       setTimeout(() => {
-        downloadMedia(item, () => {
+        // Count each item exactly once, even if downloadMedia throws before (or
+        // after) calling back - otherwise the progress bar never reaches 100%.
+        let counted = false;
+        const onDone = () => {
+          if (counted) return;
+          counted = true;
           completed++;
           const percent = Math.round((completed / total) * 100);
           progressBar.style.width = `${percent}%`;
@@ -700,21 +800,16 @@ document.addEventListener('DOMContentLoaded', function() {
               if (progressContainer) progressContainer.classList.add('hidden');
             }, 3000);
           }
+        };
+        downloadMedia(item, onDone).catch((e) => {
+          console.error('Download failed:', item.url, e);
+          onDone();
         });
       }, index * 300); // Stagger downloads to avoid issues
     });
     
-    // Clear selection after download
-    selectedItems.clear();
-    updateSelectedCount();
-    
-    // Update UI to remove selection highlights
-    document.querySelectorAll('.media-card').forEach(card => {
-      card.classList.remove('selected');
-    });
-    document.querySelectorAll('.checkbox-select').forEach(checkbox => {
-      checkbox.checked = false;
-    });
+    // Clear selection after download (state + card highlights)
+    clearSelection();
   });
   
   // Helper to fetch media URL as blob with progress
@@ -737,8 +832,9 @@ document.addEventListener('DOMContentLoaded', function() {
       if (done) break;
       chunks.push(value);
       loaded += value.byteLength;
-      if (onProgress) {
-        onProgress(loaded / total);
+      if (onProgress && total > 0) {
+        // content-length is the *compressed* size for gzip'd responses - clamp
+        onProgress(Math.min(1, loaded / total));
       }
     }
     
@@ -749,9 +845,10 @@ document.addEventListener('DOMContentLoaded', function() {
   downloadZipBtn.addEventListener('click', async () => {
     if (selectedItems.size === 0) return;
     
-    const selectedMedia = filteredMediaData.filter(item => selectedItems.has(item.url));
+    const selectedMedia = getSelectedMedia();
     const total = selectedMedia.length;
-    
+    if (total === 0) return;
+
     if (progressContainer) progressContainer.classList.remove('hidden');
     if (progressLabel) progressLabel.textContent = 'ZIP Export Progress';
     progressBar.style.width = '0%';
@@ -759,33 +856,47 @@ document.addEventListener('DOMContentLoaded', function() {
     
     const zip = new JSZip();
     let completed = 0;
-    const nameCount = {};
-    
+    const usedNames = new Set();
+    let addedFiles = 0;
+    let skippedYouTube = 0;
+
+    // Returns a name not yet used in this ZIP: photo.jpg, photo_1.jpg, photo_2.jpg...
+    // (JSZip silently overwrites an entry when the same name is added twice.)
+    const uniqueZipName = (filename) => {
+      if (!usedNames.has(filename)) {
+        usedNames.add(filename);
+        return filename;
+      }
+      const extIndex = filename.lastIndexOf('.');
+      const name = extIndex > 0 ? filename.slice(0, extIndex) : filename;
+      const ext = extIndex > 0 ? filename.slice(extIndex) : '';
+      let n = 1;
+      while (usedNames.has(`${name}_${n}${ext}`)) n++;
+      const candidate = `${name}_${n}${ext}`;
+      usedNames.add(candidate);
+      return candidate;
+    };
+
     for (let i = 0; i < total; i++) {
       const item = selectedMedia[i];
       try {
-        let filename = getFilename(item);
-        // Ensure unique filenames inside the zip
-        if (nameCount[filename]) {
-          const extIndex = filename.lastIndexOf('.');
-          if (extIndex !== -1) {
-            const name = filename.slice(0, extIndex);
-            const ext = filename.slice(extIndex);
-            filename = `${name}_${nameCount[filename]}${ext}`;
-          } else {
-            filename = `${filename}_${nameCount[filename]}`;
-          }
-          nameCount[filename]++;
-        } else {
-          nameCount[filename] = 1;
-        }
-
         const resolvedUrl = await resolveDownloadUrl(item);
+        if (!resolvedUrl) throw new Error('Could not resolve a downloadable URL');
+        // Without a real stream, resolveDownloadUrl falls back to the thumbnail -
+        // silently zipping a .jpg in place of the selected video is misleading.
+        if (item.isYouTube && item.videoId && !/googlevideo\.com/i.test(resolvedUrl)) {
+          skippedYouTube++;
+          throw new Error('YouTube video has no direct stream - use Download instead of ZIP');
+        }
+        const filename = uniqueZipName(getFilename(item, resolvedUrl));
 
         if (resolvedUrl.startsWith('data:')) {
-          const parts = resolvedUrl.split(',');
-          const isBase64 = parts[0].includes('base64');
-          const data = parts[1];
+          // Split only on the first comma - non-base64 payloads (e.g. inline SVG)
+          // can legitimately contain more commas.
+          const commaIndex = resolvedUrl.indexOf(',');
+          const header = resolvedUrl.slice(0, commaIndex);
+          const data = resolvedUrl.slice(commaIndex + 1);
+          const isBase64 = header.includes('base64');
           const content = isBase64 ? data : decodeURIComponent(data);
           zip.file(filename, content, { base64: isBase64 });
         } else {
@@ -796,6 +907,7 @@ document.addEventListener('DOMContentLoaded', function() {
           });
           zip.file(filename, blob);
         }
+        addedFiles++;
       } catch (e) {
         console.error('Failed to add file to ZIP:', item.url, e);
       }
@@ -805,8 +917,20 @@ document.addEventListener('DOMContentLoaded', function() {
       progressPercent.textContent = `${overallPercent}% (Fetching...)`;
     }
     
+    if (addedFiles === 0) {
+      progressPercent.textContent = skippedYouTube
+        ? 'YouTube videos can\'t be zipped - use Download'
+        : 'No files could be fetched';
+      setTimeout(() => {
+        progressBar.style.width = '0%';
+        progressPercent.textContent = '0%';
+        if (progressContainer) progressContainer.classList.add('hidden');
+      }, 3000);
+      return;
+    }
+
     progressPercent.textContent = 'Zipping...';
-    
+
     try {
       const zipBlob = await zip.generateAsync({ type: 'blob' }, (metadata) => {
         const percent = Math.round(metadata.percent);
@@ -822,16 +946,21 @@ document.addEventListener('DOMContentLoaded', function() {
         filename: zipName,
         saveAs: true
       }, () => {
-        setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
-        progressBar.style.width = '100%';
-        progressPercent.textContent = 'Completed!';
-        
-        // Clear selection
-        selectedItems.clear();
-        updateSelectedCount();
-        document.querySelectorAll('.media-card').forEach(card => card.classList.remove('selected'));
-        document.querySelectorAll('.checkbox-select').forEach(checkbox => checkbox.checked = false);
-        
+        // saveAs: true keeps the blob needed while the Save dialog is open - give it time
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+        if (chrome.runtime.lastError) {
+          console.error('ZIP download failed:', chrome.runtime.lastError);
+          progressPercent.textContent = 'ZIP download cancelled / failed';
+        } else {
+          progressBar.style.width = '100%';
+          progressPercent.textContent = addedFiles < total
+            ? `Completed (${addedFiles}/${total} files${skippedYouTube ? `, ${skippedYouTube} YouTube skipped` : ''})`
+            : 'Completed!';
+        }
+
+        // Clear selection (state + card highlights inside Shadow DOM)
+        clearSelection();
+
         setTimeout(() => {
           progressBar.style.width = '0%';
           progressPercent.textContent = '0%';
@@ -844,13 +973,19 @@ document.addEventListener('DOMContentLoaded', function() {
     }
   });
   
+  // Incremented on every open/close so a slow, still-resolving preview can tell it
+  // has been superseded and must not write into the modal anymore.
+  let previewSeq = 0;
+
   // Show preview modal
   async function showPreview(index) {
-    currentPreviewIndex = index;
+    const token = ++previewSeq;
+    const isStale = () => token !== previewSeq;
     revokePreviewBlobUrls();
     previewContent.innerHTML = '';
 
     const item = filteredMediaData[index];
+    if (!item) return;
     const previewItem = document.createElement('div');
     previewItem.className = 'preview-item';
 
@@ -868,6 +1003,7 @@ document.addEventListener('DOMContentLoaded', function() {
       previewContent.appendChild(previewItem);
       previewModal.classList.add('active');
       playableUrl = await resolveDownloadUrl(item);
+      if (isStale()) return;
       loading.remove();
     }
 
@@ -878,11 +1014,28 @@ document.addEventListener('DOMContentLoaded', function() {
       previewItem.appendChild(titleEl);
     }
 
+    // When the media can't be shown, say so but keep the Download buttons - removing
+    // the whole preview item used to leave an empty modal.
+    const showUnavailable = (el) => {
+      const msg = document.createElement('div');
+      msg.className = 'file-icon-large preview-unavailable';
+      msg.textContent = 'Preview not available - you can still try Download.';
+      if (el && el.parentNode) el.replaceWith(msg);
+      else previewItem.insertBefore(msg, previewItem.firstChild);
+    };
+
     if (item.type === 'image') {
       const img = document.createElement('img');
       img.src = playableUrl;
       img.alt = 'Preview image';
-      img.onerror = () => previewItem.remove();
+      img.onerror = () => {
+        // YouTube's maxresdefault doesn't exist for every video - fall back once
+        if (/ytimg\.com\/vi\/[^/]+\/maxresdefault/i.test(img.src)) {
+          img.src = img.src.replace('maxresdefault', 'hqdefault');
+          return;
+        }
+        showUnavailable(img);
+      };
       previewItem.appendChild(img);
     } else if (item.type === 'video' && hasVideoId) {
       // Iframe embeds reliably fail inside extension popups - YouTube rejects the
@@ -898,6 +1051,7 @@ document.addEventListener('DOMContentLoaded', function() {
       let resolvedStream = /googlevideo\.com/i.test(playableUrl || '') ? playableUrl : null;
       if (!resolvedStream) {
         resolvedStream = await resolveDownloadUrl(item);
+        if (isStale()) return;
       }
       // Prefer a classic progressive format (has an explicit itag) - a plain
       // googlevideo hit without one is often YouTube's newer SABR/UMP negotiation
@@ -908,6 +1062,7 @@ document.addEventListener('DOMContentLoaded', function() {
       if (!resolvedStream || !/googlevideo\.com/i.test(resolvedStream) || !/itag=\d+/i.test(resolvedStream)) {
         loading.textContent = 'Fetching video source...';
         const hiddenTabStream = await resolveStreamViaHiddenTab(item);
+        if (isStale()) return;
         if (hiddenTabStream) resolvedStream = hiddenTabStream;
       }
 
@@ -916,6 +1071,7 @@ document.addEventListener('DOMContentLoaded', function() {
         try {
           loading.textContent = 'Loading video...';
           const { base64, mimeType } = await fetchStreamBuffer(resolvedStream);
+          if (isStale()) return;
           const bytes = base64ToUint8Array(base64);
           // A "successfully fetched" response can still be worthless: some
           // googlevideo URLs (YouTube's newer SABR/UMP negotiation requests,
@@ -978,7 +1134,7 @@ document.addEventListener('DOMContentLoaded', function() {
           fallbackImg.style.borderRadius = '8px';
           previewItem.insertBefore(fallbackImg, previewItem.firstChild);
         } else {
-          previewItem.remove();
+          showUnavailable(video);
         }
       };
       previewItem.appendChild(video);
@@ -987,7 +1143,7 @@ document.addEventListener('DOMContentLoaded', function() {
       audio.src = playableUrl;
       audio.controls = true;
       audio.autoplay = true;
-      audio.onerror = () => previewItem.remove();
+      audio.onerror = () => showUnavailable(audio);
       previewItem.appendChild(audio);
     } else {
       const icon = document.createElement('div');
@@ -1003,7 +1159,9 @@ document.addEventListener('DOMContentLoaded', function() {
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="currentColor" style="width: 16px; height: 16px; vertical-align: middle; margin-right: 6px;"><path d="M256 0a256 256 0 1 0 0 512A256 256 0 1 0 256 0zM127 297l-64-64 64-64 23 23L169 221 232 221 232 105c0-13.3 10.7-24 24-24s24 10.7 24 24l0 116 63 0 17-17 23-23 64 64-64 64-23-23-17-17-63 0 0 158c0 13.3-10.7 24-24 24s-24-10.7-24-24l0-158-63 0-17 17-23 23z"/></svg>
       Download
     `;
-    downloadBtn.addEventListener('click', () => downloadMedia(item));
+    downloadBtn.addEventListener('click', () => {
+      downloadMedia(item).catch(e => console.error('Download failed:', e));
+    });
     previewItem.appendChild(downloadBtn);
 
     // Show note for YouTube videos that stream URL may be needed
@@ -1037,6 +1195,7 @@ document.addEventListener('DOMContentLoaded', function() {
   
   // Close modal and stop any playing media
   function closePreviewModal() {
+    previewSeq++; // cancel any preview still resolving in the background
     previewModal.classList.remove('active');
     revokePreviewBlobUrls();
   }
@@ -1134,18 +1293,26 @@ document.addEventListener('DOMContentLoaded', function() {
               target: { tabId: tab.id },
               world: 'MAIN',
               func: (videoId) => {
+                // The tab may be showing a different video than the one requested
+                // (e.g. a feed thumbnail). Only ever return a stream that provably
+                // belongs to `videoId` - otherwise the wrong video gets downloaded.
+                const pageId = new URLSearchParams(location.search).get('v') ||
+                  (location.pathname.match(/\/shorts\/([a-zA-Z0-9_-]{11})/) || [])[1] || null;
                 try {
-                  let pr = window.ytInitialPlayerResponse;
-                  if (!pr && window.ytplayer?.config?.args?.player_response) {
+                  const candidates = [];
+                  try {
+                    const player = document.querySelector('#movie_player');
+                    if (player && typeof player.getPlayerResponse === 'function') {
+                      candidates.push(player.getPlayerResponse());
+                    }
+                  } catch (_) {}
+                  candidates.push(window.ytInitialPlayerResponse);
+                  if (window.ytplayer?.config?.args?.player_response) {
                     try {
-                      pr = JSON.parse(window.ytplayer.config.args.player_response);
+                      candidates.push(JSON.parse(window.ytplayer.config.args.player_response));
                     } catch (_) {}
                   }
-                  // Match current player video when possible
-                  if (pr?.videoDetails?.videoId && videoId &&
-                      pr.videoDetails.videoId !== videoId) {
-                    // still try formats – may be previous page
-                  }
+                  const pr = candidates.find(c => c?.videoDetails?.videoId === videoId);
                   const formats = [
                     ...(pr?.streamingData?.formats || []),
                     ...(pr?.streamingData?.adaptiveFormats || [])
@@ -1177,6 +1344,9 @@ document.addEventListener('DOMContentLoaded', function() {
                   if (withUrl[0]?.url) return withUrl[0].url;
                   if (getUrl(withUrl[0])) return getUrl(withUrl[0]);
                 } catch (_) {}
+                // Network entries carry no video id, so they're only trustworthy
+                // when this tab is actually showing the requested video.
+                if (pageId !== videoId) return null;
                 try {
                   const resources = performance.getEntriesByType('resource');
                   for (let i = resources.length - 1; i >= 0; i--) {
@@ -1200,10 +1370,14 @@ document.addEventListener('DOMContentLoaded', function() {
               func: (videoId) => {
                 try {
                   const cache = window.__AMD_MEDIA_CACHE__ || [];
-                  const hit = cache.find(m => m.videoId === videoId && m.streamUrl) ||
-                    cache.find(m => m.url && /googlevideo\.com\/videoplayback/i.test(m.url));
-                  if (hit) return hit.streamUrl || hit.url;
+                  // Only a cache entry explicitly tagged with this video id counts
+                  const hit = cache.find(m => m.videoId === videoId && m.streamUrl &&
+                    /googlevideo\.com/i.test(m.streamUrl));
+                  if (hit) return hit.streamUrl;
                 } catch (_) {}
+                const pageId = new URLSearchParams(location.search).get('v') ||
+                  (location.pathname.match(/\/shorts\/([a-zA-Z0-9_-]{11})/) || [])[1] || null;
+                if (pageId !== videoId) return null;
                 try {
                   const resources = performance.getEntriesByType('resource');
                   for (let i = resources.length - 1; i >= 0; i--) {
@@ -1283,9 +1457,47 @@ document.addEventListener('DOMContentLoaded', function() {
       target: { tabId: tab.id },
       func: (videoId, filename) => {
         try {
-          const video = document.querySelector('video');
+          // A recording of this tab is already running (e.g. the download button was
+          // clicked twice) - just follow that one instead of starting a second recorder.
+          const running = window.__AMD_RECORDING__;
+          if (running && !running.done && !running.error) {
+            return { started: true, resumed: true };
+          }
+          // Fire-and-forget messages: nobody needs to reply, so swallow the
+          // "message port closed" / "no receiver" rejections instead of leaving
+          // unhandled promise errors in the page console every second.
+          const send = (msg) => {
+            try {
+              const p = chrome.runtime.sendMessage(msg);
+              if (p && p.catch) p.catch(() => {});
+            } catch (_) {}
+          };
+
+          // Pick the actual player, not just the first <video> in the DOM - YouTube
+          // pages also hold hover-preview / Shorts-feed players.
+          const pickMainVideo = () => {
+            const preferred = document.querySelector(
+              'ytd-reel-video-renderer[is-active] video, #shorts-player video, #movie_player video.html5-main-video'
+            );
+            if (preferred) return preferred;
+            const visibleArea = (v) => {
+              const r = v.getBoundingClientRect();
+              const w = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));
+              const h = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
+              return w * h;
+            };
+            return Array.from(document.querySelectorAll('video'))
+              .map(v => ({ v, score: (v.readyState > 0 ? 1e9 : 0) + (!v.paused ? 1e8 : 0) + visibleArea(v) }))
+              .sort((a, b) => b.score - a.score)[0]?.v || null;
+          };
+
+          const video = pickMainVideo();
           if (!video) return { error: 'No video element found' };
           if (typeof video.captureStream !== 'function') return { error: 'captureStream unsupported' };
+          // An ad plays in the same <video> element - recording now would capture the ad
+          if (document.querySelector('#movie_player.ad-showing, .ad-showing')) {
+            return { error: 'An ad is playing - wait for it to finish, then download again' };
+          }
 
           const mimeType = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm']
             .find((t) => window.MediaRecorder && MediaRecorder.isTypeSupported(t));
@@ -1293,11 +1505,14 @@ document.addEventListener('DOMContentLoaded', function() {
 
           const wasMuted = video.muted;
           const wasPaused = video.paused;
+          const wasLoop = video.loop;
           const originalTime = video.currentTime;
+          const originalSrc = video.currentSrc;
 
           const stream = video.captureStream();
           const recorder = new MediaRecorder(stream, { mimeType });
           const chunks = [];
+          let abortReason = null;
           window.__AMD_RECORDING__ = { progress: 0, done: false, error: null };
 
           recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
@@ -1305,53 +1520,108 @@ document.addEventListener('DOMContentLoaded', function() {
           // Pushed straight from the tab (not polled by the popup) so the progress
           // notification keeps updating even after the popup/preview modal closes -
           // this keeps running independent of either of those.
-          chrome.runtime.sendMessage({ action: 'recording-progress', progress: 0 });
+          send({ action: 'recording-progress', progress: 0 });
+          // Live streams / some MSE players report duration as Infinity (or NaN early on)
+          const finiteDuration = () =>
+            (Number.isFinite(video.duration) && video.duration > 0) ? video.duration : 0;
           const progressInterval = setInterval(() => {
-            if (video.duration) {
-              const pct = video.currentTime / video.duration;
+            if (finiteDuration()) {
+              const pct = Math.min(1, video.currentTime / finiteDuration());
               window.__AMD_RECORDING__.progress = pct;
-              chrome.runtime.sendMessage({ action: 'recording-progress', progress: Math.round(pct * 100) });
+              send({ action: 'recording-progress', progress: Math.round(pct * 100) });
             }
           }, 1000);
 
-          recorder.onstop = async () => {
+          let safetyTimer = null; // declared before any handler below can reference it
+          const stopRecording = (reason) => {
+            // Only the stop that actually ends the recording decides its outcome.
+            // YouTube autoplays the next video right after 'ended', which swaps the
+            // source; that late event must not turn a finished recording into an abort.
+            if (recorder.state !== 'recording') return;
+            if (reason) abortReason = reason;
+            recorder.stop();
+          };
+          const onEnded = () => stopRecording(null);
+          // Shorts (and looping players) jump back to 0 instead of firing 'ended'.
+          // Only a jump from near the end counts, so a manual seek back mid-video
+          // doesn't cut the recording short.
+          let lastTime = 0;
+          const onTimeUpdate = () => {
+            const nearEnd = finiteDuration() ? lastTime >= finiteDuration() - 1.5 : lastTime > 1;
+            if (nearEnd && video.currentTime < lastTime - 1) stopRecording(null);
+            lastTime = video.currentTime;
+          };
+          // The element got a new source (SPA navigation, next Short, autoplay) -
+          // continuing would splice a different video into this file, and stopping
+          // "normally" would save a truncated file as if it were complete.
+          // 'emptied' only fires when the element is reset for a new load (never on a
+          // loop), and it fires *before* currentSrc changes and before the position
+          // resets to 0 - so it must abort unconditionally, ahead of the loop check.
+          const INTERRUPTED = 'Recording interrupted - the video changed before it finished';
+          const onEmptied = () => stopRecording(INTERRUPTED);
+          const onLoadStart = () => {
+            if (video.currentSrc !== originalSrc) stopRecording(INTERRUPTED);
+          };
+          video.addEventListener('ended', onEnded);
+          video.addEventListener('timeupdate', onTimeUpdate);
+          video.addEventListener('emptied', onEmptied);
+          video.addEventListener('loadstart', onLoadStart);
+
+          recorder.onstop = () => {
             clearInterval(progressInterval);
+            clearTimeout(safetyTimer);
+            video.removeEventListener('ended', onEnded);
+            video.removeEventListener('timeupdate', onTimeUpdate);
+            video.removeEventListener('emptied', onEmptied);
+            video.removeEventListener('loadstart', onLoadStart);
             try {
+              video.loop = wasLoop;
               video.muted = wasMuted;
-              if (wasPaused) video.pause();
-              video.currentTime = originalTime;
-              const blob = new Blob(chunks, { type: mimeType });
-              // chrome.runtime.sendMessage serializes as if via JSON - a raw
-              // ArrayBuffer arrives at the other end as an empty object (all byte
-              // data silently lost), so send base64 instead.
-              const bytes = new Uint8Array(await blob.arrayBuffer());
-              let binary = '';
-              const chunkSize = 0x8000;
-              for (let i = 0; i < bytes.length; i += chunkSize) {
-                binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+              // Restore position only if it's still the same video - after autoplay
+              // moved on, seeking would jump the *next* video to the old timestamp.
+              if (!abortReason && video.currentSrc === originalSrc) {
+                if (wasPaused) video.pause();
+                video.currentTime = originalTime;
               }
+              if (abortReason) throw new Error(abortReason);
+              const blob = new Blob(chunks, { type: mimeType });
+              if (!blob.size) throw new Error('Recording produced no data');
+              // Save straight from the tab. Shipping the bytes to background.js
+              // doesn't scale: runtime messages cap out around 64 MB and a data: URL
+              // handed to chrome.downloads is limited to ~2 MB, so anything longer
+              // than a short clip used to fail. A blob: URL from this document plus
+              // an <a download> click has neither limit. The anchor is deliberately
+              // NOT inserted into the page, so YouTube's own SPA link-click handler
+              // can never intercept it.
+              const blobUrl = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = blobUrl;
+              a.download = filename;
+              a.click();
+              setTimeout(() => URL.revokeObjectURL(blobUrl), 120000);
               window.__AMD_RECORDING__.done = true;
-              chrome.runtime.sendMessage({ action: 'recording-complete', base64: btoa(binary), mimeType, filename });
+              send({ action: 'recording-complete', filename, size: blob.size });
             } catch (e) {
               window.__AMD_RECORDING__.error = e.message;
+              send({ action: 'recording-failed', error: e.message });
             }
           };
 
-          video.addEventListener('ended', () => {
-            if (recorder.state === 'recording') recorder.stop();
-          }, { once: true });
+          // Safety net in case 'ended' never fires (live edge cases, seek issues).
+          // Must use a finite delay: setTimeout(fn, Infinity) overflows and fires
+          // almost immediately, which used to stop the recording right away.
+          safetyTimer = setTimeout(() => stopRecording(null),
+            (finiteDuration() ? finiteDuration() * 1000 + 15000 : 30 * 60 * 1000));
 
-          // Safety net in case 'ended' never fires (live edge cases, seek issues)
-          setTimeout(() => {
-            if (recorder.state === 'recording') recorder.stop();
-          }, (video.duration ? video.duration * 1000 + 15000 : 30 * 60 * 1000));
-
+          video.loop = false;
           video.currentTime = 0;
+          // Muting only silences the speakers - the captured stream keeps the audio
+          // (verified by the extension's E2E test, which checks the recorded track)
           video.muted = true;
           recorder.start(1000);
           video.play().catch(() => {});
 
-          return { started: true, duration: video.duration };
+          return { started: true, duration: finiteDuration() };
         } catch (e) {
           return { error: e.message };
         }
@@ -1362,6 +1632,7 @@ document.addEventListener('DOMContentLoaded', function() {
     const outcome = startResult?.[0]?.result;
     if (!outcome?.started) {
       console.warn('Recording could not start:', outcome?.error);
+      lastRecordingError = outcome?.error || null;
       return false;
     }
     // The injected script itself just pushed the initial 'recording-progress'
@@ -1372,6 +1643,9 @@ document.addEventListener('DOMContentLoaded', function() {
     // Poll progress purely for UI feedback - the actual save happens independently
     // via the 'recording-complete' message to background.js, so this loop ending
     // early (e.g. popup closes) doesn't affect whether the download completes.
+    // Returns true only when the tab confirms the file was actually handed off for
+    // saving - an error, or the page navigating away mid-recording (state vanishes),
+    // reports failure so the caller can fall back instead of showing "Saved!".
     while (true) {
       await new Promise((r) => setTimeout(r, 800));
       const poll = await chrome.scripting.executeScript({
@@ -1379,60 +1653,135 @@ document.addEventListener('DOMContentLoaded', function() {
         func: () => window.__AMD_RECORDING__ || null
       }).catch(() => null);
       const state = poll?.[0]?.result;
-      if (!state) break;
+      if (!state) return false;
       if (onProgress) onProgress(state.progress || 0);
-      if (state.done || state.error) break;
+      if (state.error) {
+        console.warn('Recording failed:', state.error);
+        lastRecordingError = state.error;
+        return false;
+      }
+      if (state.done) return true;
     }
-    return true;
   }
 
   // Download media function
+  // Briefly shows a status message in the progress area, then hides it
+  function flashProgressStatus(label, text, hideAfterMs = 4000) {
+    if (progressContainer) progressContainer.classList.remove('hidden');
+    if (progressLabel) progressLabel.textContent = label;
+    progressPercent.textContent = text;
+    setTimeout(() => {
+      progressBar.style.width = '0%';
+      progressPercent.textContent = '0%';
+      if (progressContainer) progressContainer.classList.add('hidden');
+    }, hideAfterMs);
+  }
+
+  // A blob: URL only exists inside the tab that created it. Save it from there with an
+  // <a download> click - converting it to a data: URL first (the old approach) fails
+  // in chrome.downloads for anything over ~2 MB.
+  async function downloadBlobFromTab(blobUrl, filename) {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.id) throw new Error('No active tab');
+    const result = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      args: [blobUrl, filename],
+      func: async (url, name) => {
+        try {
+          // Fails for MediaSource-backed players (most social video) - those
+          // blob: URLs are a stream handle, not a downloadable file
+          const blob = await (await fetch(url)).blob();
+          if (!blob.size) return { error: 'Empty file' };
+          // The real type is only known here - fix a guessed extension (.jpg for a PNG)
+          const realExt = {
+            'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp',
+            'image/svg+xml': '.svg', 'image/avif': '.avif', 'video/mp4': '.mp4', 'video/webm': '.webm',
+            'audio/mpeg': '.mp3', 'audio/ogg': '.ogg', 'audio/wav': '.wav'
+          }[(blob.type || '').split(';')[0]];
+          if (realExt) name = name.replace(/\.[a-z0-9]{2,5}$/i, '') + realExt;
+          const localUrl = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = localUrl;
+          a.download = name;
+          a.click(); // detached on purpose - page click handlers never see it
+          setTimeout(() => URL.revokeObjectURL(localUrl), 120000);
+          return { ok: true };
+        } catch (e) {
+          return { error: e.message || String(e) };
+        }
+      }
+    });
+    const outcome = result?.[0]?.result;
+    if (!outcome?.ok) throw new Error(outcome?.error || 'Could not save the file from the tab');
+  }
+
   async function downloadMedia(mediaItem, callback) {
     if (mediaItem.isYouTube && mediaItem.videoId) {
+      let recorded = false;
+      lastRecordingError = null;
       try {
         if (progressContainer) progressContainer.classList.remove('hidden');
         if (progressLabel) progressLabel.textContent = 'Recording video (plays in the tab)...';
-        const recorded = await recordActiveTabVideo(mediaItem, (progress) => {
+        recorded = await recordActiveTabVideo(mediaItem, (progress) => {
           const percent = Math.round(progress * 100);
           progressBar.style.width = `${percent}%`;
           progressPercent.textContent = `${percent}%`;
         });
-        if (recorded) {
-          progressBar.style.width = '100%';
-          progressPercent.textContent = 'Saved!';
-          setTimeout(() => {
-            progressBar.style.width = '0%';
-            progressPercent.textContent = '0%';
-            if (progressContainer) progressContainer.classList.add('hidden');
-          }, 3000);
-          if (callback) callback();
-          return;
-        }
       } catch (e) {
         console.warn('Recording-based download failed, falling back:', e);
-      } finally {
-        if (progressContainer && progressLabel?.textContent === 'Recording video (plays in the tab)...') {
-          progressContainer.classList.add('hidden');
-        }
       }
+      if (recorded) {
+        progressBar.style.width = '100%';
+        flashProgressStatus('Recording video (plays in the tab)...', 'Saved!', 3000);
+        if (callback) callback();
+        return;
+      }
+      // Recording not possible / failed - hide its progress UI before falling back
+      if (progressContainer) progressContainer.classList.add('hidden');
     }
 
     const downloadUrl = await resolveDownloadUrl(mediaItem);
 
-    // For YouTube videos without a valid stream URL (resolveDownloadUrl falls back to
-    // the thumbnail image when it can't find one, which isn't a video), use the
-    // background approach that can also resolve the stream via a hidden tab.
-    if (mediaItem.isYouTube && mediaItem.videoId && !/googlevideo\.com/i.test(downloadUrl || '')) {
-      // Try to download via background fetch with proper referrer
+    // YouTube always goes through background.js: it validates that a googlevideo URL
+    // really yields video bytes (a plain download of a SABR/UMP URL "succeeds" with a
+    // 31-byte file), and can resolve the stream via a hidden tab when we have none.
+    // A stream we already resolved is passed along so it's tried first.
+    if (mediaItem.isYouTube && mediaItem.videoId) {
+      const knownStream = /googlevideo\.com/i.test(downloadUrl || '') ? downloadUrl : null;
       try {
-        await downloadYouTubeViaBackground(mediaItem);
-        if (callback) callback();
-        return;
+        await downloadYouTubeViaBackground(mediaItem, knownStream);
       } catch (e) {
-        console.warn('Background YouTube download failed, trying direct:', e);
+        // Do NOT fall through to a direct download here: downloadUrl is a watch
+        // page or thumbnail at this point, which would be saved as a fake ".mp4".
+        console.warn('Background YouTube download failed:', e);
+        // If recording was refused for a fixable reason (e.g. an ad is playing),
+        // that's the more useful thing to tell the user.
+        const reason = lastRecordingError ? `${lastRecordingError}` : e.message;
+        flashProgressStatus('YouTube download', `Failed: ${reason}`, 6000);
       }
+      if (callback) callback();
+      return;
     }
-    
+
+    if (mediaItem.url && mediaItem.url.startsWith('blob:') && !mediaItem.streamUrl) {
+      try {
+        await downloadBlobFromTab(mediaItem.url, getFilename(mediaItem, ''));
+      } catch (e) {
+        console.warn('Blob download failed:', e);
+        flashProgressStatus('Download', mediaItem.type === 'video'
+          ? 'Failed: streamed video (MediaSource) - play it and use a screen recorder'
+          : `Failed: ${e.message}`, 6000);
+      }
+      if (callback) callback();
+      return;
+    }
+
+    if (!downloadUrl) {
+      flashProgressStatus('Download', 'Failed: no downloadable URL');
+      if (callback) callback();
+      return;
+    }
+
     chrome.downloads.download({
       url: downloadUrl,
       filename: getFilename(mediaItem, downloadUrl),
@@ -1447,14 +1796,18 @@ document.addEventListener('DOMContentLoaded', function() {
   }
 
   // Download YouTube video via background fetch with proper headers
-  async function downloadYouTubeViaBackground(mediaItem) {
+  async function downloadYouTubeViaBackground(mediaItem, knownStreamUrl = null) {
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Background download timeout')), 30000);
-      
+      // background.js may: watch the active tab (5s) + a hidden tab (9s) + verify the
+      // direct download (up to 20s) + a full fetch fallback - 30s was far too short and
+      // made the popup give up while the background was still working.
+      const timeout = setTimeout(() => reject(new Error('Background download timeout')), 180000);
+
       chrome.runtime.sendMessage({
         action: 'download-youtube-video',
         videoId: mediaItem.videoId,
-        filename: getFilename(mediaItem, ''),
+        streamUrl: knownStreamUrl,
+        filename: getFilename(mediaItem, knownStreamUrl || ''),
         tabId: activeTabId,
         watchUrl: mediaItem.watchUrl,
         isShorts: mediaItem.isShorts
@@ -1525,35 +1878,64 @@ document.addEventListener('DOMContentLoaded', function() {
       return `${tag}_${base}${ext}`;
     }
 
-    try {
-      const url = new URL(resolvedUrl || mediaItem.url);
-      const pathParts = url.pathname.split('/');
-      const lastPart = pathParts[pathParts.length - 1];
+    const source = resolvedUrl || mediaItem.url || '';
+    const fallbackExt = mediaItem.type === 'image' ? '.jpg'
+      : mediaItem.type === 'video' ? (mediaItem.url?.startsWith('blob:') ? '.webm' : '.mp4')
+      : mediaItem.type === 'audio' ? '.mp3' : '.bin';
 
-      if (lastPart && lastPart.includes('.')) {
-        return lastPart.split('?')[0];
+    // data: / blob: URLs have no real path - the old code used the tail of the
+    // base64 payload ("png;base64,iVBOR...") as the file name
+    if (source.startsWith('data:')) {
+      const m = /^data:([a-z]+)\/([a-z0-9.+-]+)/i.exec(source);
+      const sub = m ? m[2].toLowerCase() : '';
+      const ext = sub ? ({ jpeg: '.jpg', 'svg+xml': '.svg', quicktime: '.mov' }[sub] || `.${sub.replace(/[^a-z0-9]/g, '')}`) : fallbackExt;
+      return `media-${Date.now()}${ext}`;
+    }
+    if (source.startsWith('blob:')) {
+      return `media-${Date.now()}${fallbackExt}`;
+    }
+
+    try {
+      const url = new URL(source);
+      const pathParts = url.pathname.split('/');
+      let lastPart = pathParts[pathParts.length - 1];
+      try { lastPart = decodeURIComponent(lastPart); } catch (_) {}
+      // chrome.downloads rejects names with reserved characters / a leading dot
+      lastPart = lastPart.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').replace(/^\.+/, '').trim().slice(0, 150);
+
+      if (lastPart && /\.[a-z0-9]{2,5}$/i.test(lastPart)) {
+        return lastPart;
       }
 
-      const ext = mediaItem.type === 'image' ?
-        (url.pathname.match(/\.(jpe?g|png|gif|webp)$/i) ? '' : '.jpg') :
-        (mediaItem.type === 'video' ?
-          (url.pathname.match(/\.(mp4|webm|mov)$/i) ? '' : '.mp4') :
-          (mediaItem.type === 'audio' ?
-            (url.pathname.match(/\.(mp3|wav|ogg|flac|m4a)$/i) ? '' : '.mp3') :
-            '.bin'));
-
-      return `media-${Date.now()}${ext}`;
+      // No usable file name in the path - name it by time + type
+      return `media-${Date.now()}${fallbackExt}`;
     } catch (_) {
-      return `media-${Date.now()}.bin`;
+      return `media-${Date.now()}${fallbackExt}`;
     }
   }
 });
 
 // Enhanced function to scrape ALL media from the page (deep & micro-level automation)
-async function scrapeAllMediaFromPage() {
+// `incremental` (used by the periodic auto-scan) skips the expensive work that was
+// already done for this document - re-fetching every stylesheet, re-parsing every
+// inline <script> (megabytes on YouTube) and getComputedStyle on elements already
+// checked. The popup merges results into what it already has, so only new things
+// need to be found. A full scan (popup open / Refresh) always redoes everything.
+async function scrapeAllMediaFromPage(incremental = false) {
   const mediaItems = [];
   const fetchPromises = [];
   const seenVideoIds = new Set();
+
+  // Persists across executeScript calls (same isolated world, same document)
+  const scrapeState = window.__AMD_SCRAPE_STATE__ || (window.__AMD_SCRAPE_STATE__ = {
+    styledElements: new WeakSet(),
+    scannedScripts: new WeakSet(),
+    fetchedStylesheets: new Set()
+  });
+  const allScripts = Array.from(document.querySelectorAll('script'));
+  const scriptsToScan = incremental
+    ? allScripts.filter(s => !scrapeState.scannedScripts.has(s))
+    : allScripts;
 
   // Expanded media type checker
   function getMediaType(url) {
@@ -1562,18 +1944,33 @@ async function scrapeAllMediaFromPage() {
     if (url.startsWith('data:video/')) return 'video';
     if (url.startsWith('data:audio/')) return 'audio';
     if (url.startsWith('blob:')) return 'video';
-    
-    // Expanded extensions list
-    const isVideo = /\.(mp4|webm|mov|avi|mkv|flv|wmv|m3u8|ts|mpd|oggv|3gp|m4v)(?:[\?#]|$)/i.test(url) ||
-      /youtube\.com|youtu\.be|vimeo\.com|googlevideo\.com|instagram\.com\/(?:reel|reels|p)\//i.test(url) ||
-      /videoplayback|mime=video/i.test(url);
-    const isAudio = /\.(mp3|wav|ogg|flac|m4a|aac|wma|opus|mid|midi|amr)(?:[\?#]|$)/i.test(url) || /mime=audio/i.test(url);
-    const isImage = /\.(jpe?g|png|gif|webp|svg|bmp|ico|tiff|avif|heic|jpeg|jpg)(?:[\?#]|$)/i.test(url) ||
-      /ytimg\.com|ggpht\.com/i.test(url);
-    
-    if (isVideo) return 'video';
-    if (isAudio) return 'audio';
-    if (isImage) return 'image';
+
+    let pathname = url;
+    try { pathname = new URL(url, location.href).pathname; } catch (_) {}
+
+    // Code / documents / fonts are never media, whatever host they come from
+    // (YouTube's own base.js, CSS, wasm, API endpoints used to be listed as "video")
+    if (/\.(m?js|css|json|wasm|html?|xml|txt|map|woff2?|ttf|otf|eot)$/i.test(pathname)) return 'other';
+    // YouTube beacons / bare CDN roots (i.ytimg.com/generate_204 is not an image)
+    if (/generate_204/i.test(url) || /^\/?$/.test(pathname)) return 'other';
+
+    // 1. File extension decides first (a favicon.ico on youtube.com is an image)
+    if (/\.(mp4|webm|mov|avi|mkv|flv|wmv|m3u8|ts|mpd|oggv|3gp|m4v)(?:[\?#]|$)/i.test(url)) return 'video';
+    if (/\.(mp3|wav|ogg|flac|m4a|aac|wma|opus|mid|midi|amr)(?:[\?#]|$)/i.test(url)) return 'audio';
+    if (/\.(jpe?g|png|gif|webp|svg|bmp|ico|tiff|avif|heic)(?:[\?#]|$)/i.test(url)) return 'image';
+
+    // 2. Stream / CDN signatures. Only googlevideo *videoplayback* is media - its
+    //    /initplayback warm-up pings (hundreds on a search page) are not.
+    if (/googlevideo\.com/i.test(url)) return /\/videoplayback/i.test(url) ? 'video' : 'other';
+    if (/videoplayback|mime=video/i.test(url)) return 'video';
+    if (/mime=audio/i.test(url)) return 'audio';
+    if (/(?:ytimg|ggpht)\.com/i.test(url)) return 'image';
+
+    // 3. Video *pages* - only when the URL actually identifies a video, not any
+    //    youtube.com / vimeo.com URL (channel pages, search, scripts, APIs...)
+    if (/youtube\.com|youtu\.be|youtube-nocookie\.com/i.test(url) && extractYouTubeVideoId(url)) return 'video';
+    if (/vimeo\.com\/(?:video\/)?\d+/i.test(url)) return 'video';
+    if (/instagram\.com\/(?:reel|reels|p)\//i.test(url)) return 'video';
     return 'other';
   }
 
@@ -1683,7 +2080,16 @@ async function scrapeAllMediaFromPage() {
 
   function addYouTubeVideo(videoId, meta = {}) {
     if (!videoId || !/^[a-zA-Z0-9_-]{11}$/.test(videoId)) return;
-    if (seenVideoIds.has(videoId) && !meta.streamUrl) return;
+    if (seenVideoIds.has(videoId) && !meta.streamUrl) {
+      // Already listed (often first seen via a source with no title, e.g. a script
+      // blob) - still fill in a title/thumbnail found later instead of dropping it.
+      const existing = mediaItems.find(m => m.videoId === videoId);
+      if (existing) {
+        if (meta.title && !existing.title) existing.title = meta.title;
+        if (meta.thumbnail && !existing.thumbnail) existing.thumbnail = meta.thumbnail;
+      }
+      return;
+    }
     seenVideoIds.add(videoId);
 
     const shorts = meta.isShorts === true || isShortsUrl(meta.watchUrl || '');
@@ -1693,7 +2099,9 @@ async function scrapeAllMediaFromPage() {
 
     mediaItems.push({
       type: 'video',
-      url: streamUrl || watchUrl,
+      // Always the watch URL: it's the stable identity for this video (selection,
+      // cards). The download path prefers `streamUrl` when one is known.
+      url: watchUrl,
       watchUrl,
       streamUrl,
       thumbnail,
@@ -1717,7 +2125,6 @@ async function scrapeAllMediaFromPage() {
       const details = pr.videoDetails || {};
       const videoId = details.videoId;
       const title = details.title || null;
-      const isLive = details.isLiveContent;
       const micro = pr.microformat?.playerMicroformatRenderer || {};
       const isShorts = /shorts/i.test(micro.ownerProfileUrl || '') ||
         /shorts/i.test(location.pathname) ||
@@ -1812,10 +2219,16 @@ async function scrapeAllMediaFromPage() {
     // Current page URL
     const pageId = extractYouTubeVideoId(location.href);
     if (pageId) {
+      // "(3) Me at the zoo - YouTube" -> "Me at the zoo". While the page is still
+      // loading the title is just "YouTube" - that's not a video title.
+      const pageTitle = (document.title || '')
+        .replace(/^\(\d+\+?\)\s*/, '')
+        .replace(/\s*-\s*YouTube$/, '')
+        .trim();
       addYouTubeVideo(pageId, {
         isShorts: location.pathname.startsWith('/shorts'),
         source: 'page-url',
-        title: document.title?.replace(/ - YouTube$/, '') || null
+        title: pageTitle && pageTitle !== 'YouTube' ? pageTitle : null
       });
     }
 
@@ -1832,7 +2245,7 @@ async function scrapeAllMediaFromPage() {
     } catch (_) {}
 
     // Parse inline scripts for ytInitial* payloads (works in isolated world)
-    document.querySelectorAll('script').forEach(script => {
+    scriptsToScan.forEach(script => {
       const text = script.textContent || '';
       if (!text || text.length < 50) return;
       if (text.includes('ytInitialPlayerResponse')) {
@@ -1860,8 +2273,11 @@ async function scrapeAllMediaFromPage() {
       const href = a.href || a.getAttribute('href') || '';
       const id = extractYouTubeVideoId(href);
       if (!id) return;
-      const title = a.getAttribute('title') || a.getAttribute('aria-label') ||
-        (a.textContent || '').trim().slice(0, 120) || null;
+      // The thumbnail anchor's text is just the duration overlay ("0:19 Now playing")
+      // - only use text that looks like an actual title.
+      const text = (a.textContent || '').replace(/\s+/g, ' ').trim();
+      const textTitle = text.length >= 3 && !/^[\d:\s]+(now playing|live|shorts)?$/i.test(text) ? text.slice(0, 120) : null;
+      const title = a.getAttribute('title') || a.getAttribute('aria-label') || textTitle || null;
       addYouTubeVideo(id, {
         watchUrl: href.startsWith('http') ? href : ytWatchUrl(id, isShortsUrl(href)),
         title,
@@ -2029,6 +2445,17 @@ async function scrapeAllMediaFromPage() {
     try {
       // Resolve relative URLs
       const absoluteUrl = new URL(cleanUrl, window.location.href).href;
+      // A caller's type hint (meta tags, cache, <video>) must not let scripts,
+      // stylesheets, API calls or beacons through as "media"
+      if (!/^(data|blob):/i.test(absoluteUrl)) {
+        const path = new URL(absoluteUrl).pathname;
+        // (.php/.aspx stay allowed - "thumb.php?id=1" is a common image endpoint)
+        if (/\.(m?js|css|json|wasm|html?|xml|txt|map|woff2?|ttf|otf|eot)$/i.test(path) ||
+            /generate_204/i.test(absoluteUrl) ||
+            (typeOverride !== 'video' && /^\/?$/.test(path))) {
+          return;
+        }
+      }
       const type = typeOverride || getMediaType(absoluteUrl);
 
       // googlevideo streams
@@ -2098,18 +2525,26 @@ async function scrapeAllMediaFromPage() {
 
       // Check standard tags
       if (tagName === 'IMG') {
-        addMediaItem(element.src || element.getAttribute('src'), element);
+        // Always 'image': an <img> blob:/data: src has no extension, and
+        // getMediaType() treats every blob: URL as video
+        addMediaItem(element.src || element.getAttribute('src'), element, 'image');
         const srcset = element.getAttribute('srcset');
         if (srcset) {
           srcset.split(',').forEach(item => {
             const parts = item.trim().split(/\s+/);
-            if (parts[0]) addMediaItem(parts[0], element);
+            if (parts[0]) addMediaItem(parts[0], element, 'image');
           });
         }
       } else if (tagName === 'VIDEO') {
         // Force 'video' type override since blob: src URLs (common on Instagram/Facebook
         // players) have no file extension for getMediaType() to infer from.
-        addMediaItem(element.src || element.getAttribute('src'), element, 'video');
+        // On YouTube the player's blob: src is a MediaSource handle (never
+        // downloadable) and the video is already listed by its id - skip it there.
+        const videoSrc = element.src || element.getAttribute('src');
+        const isYouTubeHost = /(^|\.)youtube\.com$/i.test(location.hostname);
+        if (!(isYouTubeHost && videoSrc && videoSrc.startsWith('blob:'))) {
+          addMediaItem(videoSrc, element, 'video');
+        }
         // Check video sources
         element.querySelectorAll('source').forEach(source => {
           addMediaItem(source.src || source.getAttribute('src'), element, 'video');
@@ -2135,7 +2570,9 @@ async function scrapeAllMediaFromPage() {
                 element
               });
             }
-          } else {
+          } else if (getMediaType(src) !== 'other') {
+            // Only iframes that point at actual media / known video hosts (e.g. Vimeo) -
+            // not every ad, tracker or widget frame on the page.
             addMediaItem(src, element, 'video');
           }
         }
@@ -2156,8 +2593,10 @@ async function scrapeAllMediaFromPage() {
         addMediaItem(element.src || element.getAttribute('src') || element.data || element.getAttribute('data'), element);
       }
 
-      // 3. Computed CSS Background Images check
-      const computed = window.getComputedStyle(element);
+      // 3. Computed CSS Background Images check (expensive - once per element when incremental)
+      const skipComputed = incremental && scrapeState.styledElements.has(element);
+      scrapeState.styledElements.add(element);
+      const computed = skipComputed ? null : window.getComputedStyle(element);
       if (computed) {
         const bgImg = computed.backgroundImage;
         if (bgImg && bgImg !== 'none') {
@@ -2211,7 +2650,7 @@ async function scrapeAllMediaFromPage() {
   });
 
   // 5.5. Parse inline <script> tags for raw JSON data/URLs (crucial for React/Relay state on Instagram/Facebook)
-  document.querySelectorAll('script').forEach(scriptTag => {
+  scriptsToScan.forEach(scriptTag => {
     try {
       if (scriptTag.textContent) {
         scanTextForUrls(scriptTag.textContent, 'Inline <script> tag');
@@ -2220,7 +2659,7 @@ async function scrapeAllMediaFromPage() {
   });
 
   // 6. Parse JSON-LD metadata scripts
-  document.querySelectorAll('script[type="application/ld+json"]').forEach(scriptTag => {
+  scriptsToScan.filter(s => s.type === 'application/ld+json').forEach(scriptTag => {
     try {
       const json = JSON.parse(scriptTag.textContent);
       const findUrlsRecursive = (obj) => {
@@ -2267,9 +2706,12 @@ async function scrapeAllMediaFromPage() {
   // 7. Parse external stylesheets via link tags
   const stylesheets = document.querySelectorAll('link[rel="stylesheet"]');
   stylesheets.forEach((link) => {
+    const cssUrl = link.href;
+    if (!cssUrl) return;
+    if (incremental && scrapeState.fetchedStylesheets.has(cssUrl)) return;
+    scrapeState.fetchedStylesheets.add(cssUrl);
     fetchPromises.push((async () => {
       try {
-        const cssUrl = link.href;
         if (cssUrl) {
           let cssText;
           try {
@@ -2360,13 +2802,17 @@ async function scrapeAllMediaFromPage() {
   } catch (e) {}
 
   // 8.7 MAIN-world progressive streams stored on <html data-amd-streams>
+  // Each entry is { url, videoId } - the id is recorded by the MAIN-world hook at the
+  // moment the stream was seen, so streams from earlier SPA pages keep their own id.
   try {
     const raw = document.documentElement.getAttribute('data-amd-streams');
-    const vid = document.documentElement.getAttribute('data-amd-vid') || extractYouTubeVideoId(location.href);
     if (raw) {
       const streams = JSON.parse(raw);
       if (Array.isArray(streams)) {
-        streams.forEach(url => {
+        streams.forEach(entry => {
+          const url = entry && typeof entry === 'object' ? entry.url : null;
+          const vid = entry && typeof entry === 'object' ? entry.videoId : null;
+          if (!url) return;
           if (vid) {
             addYouTubeVideo(vid, {
               streamUrl: url,
@@ -2393,11 +2839,12 @@ async function scrapeAllMediaFromPage() {
       if (seenIds.has(item.videoId)) {
         const existing = uniqueMediaItems.find(x => x.videoId === item.videoId);
         if (existing && item.streamUrl && !existing.streamUrl) {
+          // Upgrade with the stream, but keep the existing entry's stable url/title
+          const stableUrl = existing.url;
+          const stableTitle = existing.title;
           Object.assign(existing, item);
-          if (item.streamUrl) {
-            existing.url = item.streamUrl;
-            existing.streamUrl = item.streamUrl;
-          }
+          existing.url = stableUrl;
+          existing.title = existing.title || stableTitle;
         } else if (existing && item.title && !existing.title) {
           existing.title = item.title;
         } else if (existing && item.thumbnail && !existing.thumbnail) {
@@ -2412,7 +2859,18 @@ async function scrapeAllMediaFromPage() {
       uniqueMediaItems.push(item);
     }
   });
-  
+
+  // Remember which inline scripts were parsed so incremental scans skip them
+  scriptsToScan.forEach(s => scrapeState.scannedScripts.add(s));
+
+  // executeScript results are JSON-serialized - make sure no DOM node rides along
+  // in `element` (e.g. the iframe embed path passes the element itself).
+  uniqueMediaItems.forEach(item => {
+    if (item.element && typeof item.element === 'object') {
+      item.element = item.element.outerHTML ? item.element.outerHTML.slice(0, 150) + '...' : 'Element';
+    }
+  });
+
   return uniqueMediaItems;
 }
 
@@ -2425,10 +2883,19 @@ class MediaCardElement extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: 'open' });
+    // Registered once here (not in render(), which runs on every attribute change -
+    // that used to stack 6-8 listeners per card and open the preview that many times).
+    // Clicks on the checkbox/download button call stopPropagation, so only clicks on
+    // the thumbnail itself reach this.
+    this.addEventListener('click', () => {
+      this.dispatchEvent(new CustomEvent('preview-media'));
+    });
   }
 
   attributeChangedCallback(name, oldValue, newValue) {
-    if (oldValue !== newValue) {
+    // Skip the burst of renders while attributes are set before insertion -
+    // connectedCallback renders once with the final state.
+    if (oldValue !== newValue && this.isConnected) {
       this.render();
     }
   }
@@ -2438,6 +2905,8 @@ class MediaCardElement extends HTMLElement {
   }
 
   render() {
+    const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+      .replace(/</g, '&lt;').replace(/>/g, '&gt;');
     const url = this.getAttribute('url') || '';
     const type = this.getAttribute('type') || '';
     const selected = this.hasAttribute('selected');
@@ -2588,20 +3057,22 @@ class MediaCardElement extends HTMLElement {
     // the popup's own document, so show a placeholder icon instead of a dead <img>/<video>.
     const isBlob = url.startsWith('blob:');
     const isYtPage = isYouTube && /youtube\.com|youtu\.be/i.test(url) && !/googlevideo\.com/i.test(url);
-    const displayImage = thumbnail || (isYtPage ? '' : '');
-    const canUseVideoTag = type === 'video' && !isBlob && !isYtPage &&
-      (/\.(mp4|webm|mov|m4v)(?:[\?#]|$)/i.test(url) || /googlevideo\.com|blob:/i.test(url) || url.startsWith('data:video'));
+    // googlevideo streams are never loaded into a card: the popup's origin gets 403,
+    // and a <video preload> would pull stream data just to draw a thumbnail
+    const isStream = /googlevideo\.com/i.test(url);
+    const canUseVideoTag = type === 'video' && !isBlob && !isYtPage && !isStream &&
+      (/\.(mp4|webm|mov|m4v)(?:[\?#]|$)/i.test(url) || url.startsWith('data:video'));
 
     let contentHtml = '';
     if (type === 'image' && !isBlob) {
-      contentHtml = `<img src="${url}" alt="Media Image">`;
+      contentHtml = `<img src="${esc(url)}" alt="Media Image">`;
     } else if (type === 'video' && (thumbnail || isYtPage)) {
       const thumbSrc = thumbnail || (this.getAttribute('video-id')
         ? `https://i.ytimg.com/vi/${this.getAttribute('video-id')}/hqdefault.jpg`
         : '');
       contentHtml = `
         <div class="video-wrapper">
-          ${thumbSrc ? `<img src="${thumbSrc}" alt="${title || 'YouTube'}">` : ''}
+          ${thumbSrc ? `<img src="${esc(thumbSrc)}" alt="${esc(title || 'YouTube')}">` : ''}
           <div class="video-overlay">
             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
               <path d="M504 256C504 119 393 8 256 8S8 119 8 256s111 248 248 248 248-111 248-248zM192 144c0-13.3 14.3-22.3 25.4-15l176 112c9.7 6.2 9.7 20.8 0 27l-176 112c-11.1 7.3-25.4-1.7-25.4-15V144z"/>
@@ -2613,7 +3084,7 @@ class MediaCardElement extends HTMLElement {
     } else if (type === 'video' && canUseVideoTag) {
       contentHtml = `
         <div class="video-wrapper">
-          <video src="${url}" preload="metadata" muted></video>
+          <video src="${esc(url)}" preload="metadata" muted></video>
           <div class="video-overlay">
             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
               <path d="M504 256C504 119 393 8 256 8S8 119 8 256s111 248 248 248 248-111 248-248zM192 144c0-13.3 14.3-22.3 25.4-15l176 112c9.7 6.2 9.7 20.8 0 27l-176 112c-11.1 7.3-25.4-1.7-25.4-15V144z"/>
@@ -2621,11 +3092,11 @@ class MediaCardElement extends HTMLElement {
           </div>
         </div>
       `;
-    } else if (type === 'video' && !isBlob) {
+    } else if (type === 'video' && !isBlob && !isStream) {
       // Generic video URL – try video tag, hide on error via handler below
       contentHtml = `
         <div class="video-wrapper">
-          <video src="${url}" preload="metadata" muted></video>
+          <video src="${esc(url)}" preload="metadata" muted></video>
           <div class="video-overlay">
             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
               <path d="M504 256C504 119 393 8 256 8S8 119 8 256s111 248 248 248 248-111 248-248zM192 144c0-13.3 14.3-22.3 25.4-15l176 112c9.7 6.2 9.7 20.8 0 27l-176 112c-11.1 7.3-25.4-1.7-25.4-15V144z"/>
@@ -2661,6 +3132,19 @@ class MediaCardElement extends HTMLElement {
       this.dispatchEvent(new CustomEvent('media-loaded'));
     };
     const triggerError = () => {
+      // A video is often still downloadable when the popup itself can't play it
+      // (referrer/CORS-protected CDNs) or only its thumbnail failed - show a
+      // placeholder instead of hiding it. Only broken images are dropped.
+      if (this.getAttribute('video-id') || type === 'video' || type === 'audio') {
+        const broken = this.shadowRoot.querySelector('img, video');
+        if (broken) {
+          const icon = document.createElement('div');
+          icon.className = 'file-icon';
+          icon.textContent = '▶';
+          broken.replaceWith(icon);
+        }
+        return;
+      }
       this.style.display = 'none';
       this.dispatchEvent(new CustomEvent('media-error'));
     };
@@ -2713,13 +3197,7 @@ class MediaCardElement extends HTMLElement {
       e.stopPropagation();
       this.dispatchEvent(new CustomEvent('download-media'));
     });
-
-    // Clicking the thumbnail/card opens the preview and auto-plays video/audio.
-    // Selection stays on the checkbox so it doesn't conflict with playback.
-    this.addEventListener('click', (e) => {
-      if (e.target !== this) return;
-      this.dispatchEvent(new CustomEvent('preview-media'));
-    });
+    // Card click -> preview is registered once in the constructor.
   }
 }
 customElements.define('media-card-element', MediaCardElement);

@@ -44,17 +44,80 @@ function updateRecordingProgress(progress) {
 // Register context menu items on installation
 chrome.runtime.onInstalled.addListener(() => {
   console.log('Auto Media Downloader extension installed.');
-  
-  // Create a context menu option for media files (expanded to link and page contexts)
-  chrome.contextMenus.create({
-    id: "download-media",
-    title: "Download Media with Auto Downloader",
-    contexts: ["image", "video", "audio", "link", "page"]
+
+  // onInstalled also fires on update/reload, when the item may still exist -
+  // clear first so create() doesn't fail with "duplicate id".
+  chrome.contextMenus.removeAll(() => {
+    chrome.contextMenus.create({
+      id: "download-media",
+      title: "Download Media with Auto Downloader",
+      contexts: ["image", "video", "audio", "link", "page"]
+    });
   });
 });
 
+// Anything at or below this size is not real media - e.g. YouTube's SABR/UMP
+// handshake that a plain GET of some googlevideo URLs returns (verified: 31 bytes).
+const MIN_VALID_MEDIA_BYTES = 20000;
+
+// Service workers have no URL.createObjectURL, and data: URLs passed to
+// chrome.downloads are capped at ~2 MB, so large fetched files are turned into a
+// blob: URL inside an offscreen document (an extension page, so its blob URLs are
+// downloadable from here) - see offscreen.js.
+let offscreenReady = null;
+async function ensureOffscreenDocument() {
+  if (offscreenReady) return offscreenReady;
+  offscreenReady = (async () => {
+    try {
+      if (chrome.offscreen.hasDocument && await chrome.offscreen.hasDocument()) return;
+      await chrome.offscreen.createDocument({
+        url: 'offscreen.html',
+        reasons: ['BLOBS'],
+        justification: 'Turn fetched video data into a blob: URL that chrome.downloads can save'
+      });
+    } catch (e) {
+      // "Only a single offscreen document may be created" -> it already exists
+      if (!/single offscreen/i.test(e?.message || '')) {
+        offscreenReady = null;
+        throw e;
+      }
+    }
+  })();
+  return offscreenReady;
+}
+
+function sendToOffscreen(message) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage({ target: 'offscreen', ...message }, (response) => {
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else resolve(response);
+    });
+  });
+}
+
+// Video id shown by a YouTube tab URL (watch or shorts), or null
+function videoIdFromTabUrl(url) {
+  try {
+    const u = new URL(url);
+    return u.searchParams.get('v') ||
+      (u.pathname.match(/\/shorts\/([a-zA-Z0-9_-]{11})/) || [])[1] || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function tabShowsVideo(tabId, videoId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    return !!tab?.url && videoIdFromTabUrl(tab.url) === videoId;
+  } catch (_) {
+    return false;
+  }
+}
+
 // Handle YouTube video download requests from popup
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.target === 'offscreen') return; // meant for offscreen.js, not us
   if (request.action === 'download-youtube-video') {
     handleYouTubeDownload(request, sendResponse);
     return true; // Keep message channel open for async
@@ -65,6 +128,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
   if (request.action === 'recording-progress') {
     updateRecordingProgress(request.progress);
+    sendResponse({ received: true }); // reply so the tab's sendMessage promise doesn't reject
     return;
   }
   if (request.action === 'resolve-youtube-stream') {
@@ -75,53 +139,29 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       .then((streamUrl) => sendResponse({ success: !!streamUrl, streamUrl }));
     return true; // Keep message channel open for async
   }
-  // Pushed by the content script once a real-time tab recording finishes (see
-  // recordActiveTabVideo in popup.js) - handled here rather than in popup.js so the
-  // download still lands even if the popup was closed while the video played out.
+  // Pushed by the tab once a real-time recording finishes (see recordActiveTabVideo
+  // in popup.js). The tab saves the file itself via a blob: URL + <a download> -
+  // shipping the bytes here hit the ~64 MB message limit and the ~2 MB data: URL
+  // limit of chrome.downloads - so this only has to update the notifications, which
+  // still works even if the popup was closed while the video played out.
   if (request.action === 'recording-complete') {
-    handleRecordingComplete(request);
+    chrome.notifications.clear(RECORDING_NOTIFICATION_ID);
+    const sizeMb = request.size ? ` (${(request.size / (1024 * 1024)).toFixed(1)} MB)` : '';
+    notify('Video saved', `${request.filename || 'Recorded video'}${sizeMb}`);
     sendResponse({ received: true });
-    return true;
+    return;
+  }
+  if (request.action === 'recording-failed') {
+    chrome.notifications.clear(RECORDING_NOTIFICATION_ID);
+    notify('Recording failed', request.error || 'Could not save the recorded video.');
+    sendResponse({ received: true });
+    return;
   }
 });
 
-// Saves a video recorded in real time (via HTMLMediaElement.captureStream() +
-// MediaRecorder) from the actual decoded playback - used as the primary YouTube
-// download method since it doesn't depend on YouTube's stream-delivery format at all
-// (sidesteps the SABR/UMP issue entirely), at the cost of taking real playback time.
-async function handleRecordingComplete({ base64, mimeType, filename }) {
-  try {
-    // Service workers don't have URL.createObjectURL (verified: throws "not a
-    // function"), and a blob: URL created elsewhere wouldn't resolve here anyway -
-    // blob URLs are scoped to the document that created them. A data: URL is a
-    // plain string, so it needs neither. The content script already base64-encoded
-    // this (chrome.runtime.sendMessage would otherwise silently empty a raw buffer).
-    // Strip any ";codecs=vp9,opus" suffix - data: URLs use comma as a structural
-    // delimiter, so a codecs value containing one (verified) corrupts the whole URL.
-    const baseMimeType = (mimeType || 'video/webm').split(';')[0];
-    const finalFilename = filename || `yt_recording_${Date.now()}.webm`;
-    chrome.notifications.clear(RECORDING_NOTIFICATION_ID);
-    chrome.downloads.download({
-      url: `data:${baseMimeType};base64,${base64}`,
-      filename: finalFilename,
-      saveAs: false,
-      conflictAction: 'uniquify'
-    }, (downloadId) => {
-      // This still lands in Chrome's own download shelf/toolbar icon automatically -
-      // the notification here is extra visibility since the popup that started the
-      // recording is very likely already closed by the time this fires.
-      if (chrome.runtime.lastError || !downloadId) {
-        notify('Download failed', chrome.runtime.lastError?.message || 'Could not save the recorded video.');
-      } else {
-        notify('Video downloaded', finalFilename);
-      }
-    });
-  } catch (e) {
-    chrome.notifications.clear(RECORDING_NOTIFICATION_ID);
-    notify('Download failed', e.message);
-    console.error('Failed to save recorded video:', e);
-  }
-}
+// Upper bound for the popup preview, whose bytes travel back through a runtime
+// message as base64 (+33%) - messages are capped at ~64 MB.
+const MAX_PREVIEW_BYTES = 40 * 1024 * 1024;
 
 // Fetch a googlevideo stream with a spoofed YouTube referrer (required by the CDN)
 // and hand the raw bytes back so the popup can play it from a same-origin blob: URL -
@@ -144,7 +184,16 @@ async function handleFetchStreamBuffer(request, sendResponse) {
       sendResponse({ success: false, error: `HTTP ${response.status}` });
       return;
     }
+    const declaredLength = parseInt(response.headers.get('content-length') || '0', 10);
+    if (declaredLength > MAX_PREVIEW_BYTES) {
+      sendResponse({ success: false, error: 'Video too large for inline preview' });
+      return;
+    }
     const blob = await response.blob();
+    if (blob.size > MAX_PREVIEW_BYTES) {
+      sendResponse({ success: false, error: 'Video too large for inline preview' });
+      return;
+    }
     // chrome.runtime.sendMessage/sendResponse serializes payloads as if via JSON -
     // an ArrayBuffer arrives on the other end as an empty object (verified: all byte
     // data silently lost). A base64 string survives intact, so encode here instead.
@@ -171,6 +220,7 @@ function captureGooglevideoUrl(tabId, timeoutMs) {
   return new Promise((resolve) => {
     let anyHit = null;
     let settled = false;
+    let timer = null; // declared before finish() can reference it
     const finish = (url) => {
       if (settled) return;
       settled = true;
@@ -189,23 +239,25 @@ function captureGooglevideoUrl(tabId, timeoutMs) {
       else if (!anyHit) anyHit = details.url;
     }
     chrome.webRequest.onBeforeRequest.addListener(listener, { urls: ['*://*.googlevideo.com/*'] });
-    const timer = setTimeout(() => finish(anyHit), timeoutMs);
+    timer = setTimeout(() => finish(anyHit), timeoutMs);
   });
 }
 
 // Fire-and-forget: retries play() for a while since YouTube's SPA UI mounts the
 // <video> element progressively, so it may not exist yet right after navigation.
-function nudgePlayback(tabId) {
+// `mute` is only used for our own hidden tab - the user's visible tab is left as is.
+function nudgePlayback(tabId, mute) {
   chrome.scripting.executeScript({
     target: { tabId },
     world: 'MAIN',
-    func: async () => {
+    args: [!!mute],
+    func: async (mute) => {
       const deadline = Date.now() + 8000;
       while (Date.now() < deadline) {
         const video = document.querySelector('video');
         if (video) {
           try {
-            video.muted = true;
+            if (mute) video.muted = true;
             const p = video.play();
             if (p && p.catch) p.catch(() => {});
             return;
@@ -218,12 +270,15 @@ function nudgePlayback(tabId) {
 }
 
 // Fast, cheap fallback for the rare video/client that still populates it directly.
-async function extractStaticStreamUrl(tabId) {
+// Only accepts a player response that belongs to `videoId` (ytInitialPlayerResponse
+// goes stale after YouTube's SPA navigation and would yield a different video).
+async function extractStaticStreamUrl(tabId, videoId) {
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
-      func: () => {
+      args: [videoId || null],
+      func: (videoId) => {
         function extractUrl(f) {
           if (f.url) return f.url;
           const cs = f.signatureCipher || f.cipher;
@@ -242,8 +297,17 @@ async function extractStaticStreamUrl(tabId) {
           return null;
         }
         try {
-          const pr = window.ytInitialPlayerResponse;
-          if (!pr?.streamingData) return null;
+          const candidates = [];
+          try {
+            const player = document.querySelector('#movie_player');
+            if (player && typeof player.getPlayerResponse === 'function') {
+              candidates.push(player.getPlayerResponse());
+            }
+          } catch (_) {}
+          candidates.push(window.ytInitialPlayerResponse);
+          const pr = candidates.find(c => c?.streamingData &&
+            (!videoId || c.videoDetails?.videoId === videoId));
+          if (!pr) return null;
           const formats = [
             ...(pr.streamingData.formats || []),
             ...(pr.streamingData.adaptiveFormats || [])
@@ -264,12 +328,14 @@ async function extractStaticStreamUrl(tabId) {
 
 // Pulls a real, directly-downloadable googlevideo stream URL out of whatever tab is
 // passed in, nudging playback along and watching the network for the resulting request.
-async function extractStreamFromTab(tabId, timeoutMs) {
+// Callers must make sure the tab is actually showing `videoId` - network requests
+// carry no video id, so this captures whatever that tab plays.
+async function extractStreamFromTab(tabId, timeoutMs, videoId, mute) {
   const capture = captureGooglevideoUrl(tabId, timeoutMs);
-  nudgePlayback(tabId);
+  nudgePlayback(tabId, mute);
   const networkUrl = await capture;
   if (networkUrl) return networkUrl;
-  return await extractStaticStreamUrl(tabId);
+  return await extractStaticStreamUrl(tabId, videoId);
 }
 
 // Thumbnails scraped from a feed only carry a videoId - the real streaming formats
@@ -281,11 +347,14 @@ async function resolveStreamViaHiddenTab(videoId, watchUrl) {
     const tab = await chrome.tabs.create({ url: watchUrl, active: false });
     hiddenTabId = tab.id;
     if (!hiddenTabId) return null;
+    // Mute at the tab level right away - YouTube may autoplay with sound before
+    // nudgePlayback's element-level mute gets a chance to run.
+    chrome.tabs.update(hiddenTabId, { muted: true }).catch(() => {});
 
     // webRequest observation is attached before playback even has a chance to start
     // (extractStreamFromTab does this immediately), so there's no need to wait for
     // the tab's 'complete' status first.
-    return await extractStreamFromTab(hiddenTabId, 9000);
+    return await extractStreamFromTab(hiddenTabId, 9000, videoId, true);
   } catch (e) {
     console.warn('Hidden-tab stream resolve failed:', e);
     return null;
@@ -298,31 +367,37 @@ async function resolveStreamViaHiddenTab(videoId, watchUrl) {
 
 // chrome.downloads.download()'s callback only confirms the download was *queued* -
 // a rejected/expired googlevideo URL still gets a downloadId back and then fails
-// moments later (shows up in history as "File wasn't available on site"). Wait for
-// the actual terminal state before trusting it succeeded.
-function waitForDownloadResult(downloadId, timeoutMs) {
+// moments later ("File wasn't available on site"), and a SABR/UMP URL "completes"
+// with a 31-byte file. So poll the item until it proves itself:
+//   - interrupted, or a UMP/HTML payload            -> false
+//   - complete                                       -> true only if big enough
+//   - still in progress but already past the minimum -> true (real data flowing)
+// The old check waited for 'complete' within 8s, so any normal-sized video was
+// treated as failed, erased mid-transfer and downloaded a second time.
+function verifyDownload(downloadId, timeoutMs) {
   return new Promise((resolve) => {
-    let settled = false;
-    const finish = (ok) => {
-      if (settled) return;
-      settled = true;
-      chrome.downloads.onChanged.removeListener(listener);
-      clearTimeout(timer);
-      resolve(ok);
+    const deadline = Date.now() + timeoutMs;
+    const check = () => {
+      chrome.downloads.search({ id: downloadId }, (results) => {
+        const item = results && results[0];
+        if (!item || item.state === 'interrupted') return resolve(false);
+        if (/vnd\.yt-ump|text\/html/i.test(item.mime || '')) return resolve(false);
+        if (item.state === 'complete') {
+          return resolve((item.fileSize || item.bytesReceived || 0) > MIN_VALID_MEDIA_BYTES);
+        }
+        if ((item.bytesReceived || 0) > MIN_VALID_MEDIA_BYTES) return resolve(true);
+        if (Date.now() >= deadline) return resolve(false);
+        setTimeout(check, 500);
+      });
     };
-    function listener(delta) {
-      if (delta.id !== downloadId || !delta.state) return;
-      if (delta.state.current === 'complete') finish(true);
-      else if (delta.state.current === 'interrupted') finish(false);
-    }
-    chrome.downloads.onChanged.addListener(listener);
-    // Covers the case where it already completed/failed before the listener attached
-    chrome.downloads.search({ id: downloadId }, (results) => {
-      const item = results && results[0];
-      if (item?.state === 'complete') finish(true);
-      else if (item?.state === 'interrupted') finish(false);
-    });
-    const timer = setTimeout(() => finish(false), timeoutMs);
+    check();
+  });
+}
+
+function discardDownload(downloadId) {
+  chrome.downloads.cancel(downloadId, () => {
+    void chrome.runtime.lastError; // already finished/failed - nothing to cancel
+    chrome.downloads.erase({ id: downloadId }, () => void chrome.runtime.lastError);
   });
 }
 
@@ -343,86 +418,120 @@ function queueDownload(url, filename) {
   });
 }
 
-// A completed download can still be worthless: some googlevideo URLs (YouTube's
-// newer SABR/UMP negotiation requests, lacking an explicit itag) return a tiny
-// protocol handshake instead of actual media if fetched as a plain file - verified
-// directly, one such "successful" download was 31 bytes of application/vnd.yt-ump.
-async function isDownloadValid(downloadId) {
-  const results = await new Promise((resolve) => chrome.downloads.search({ id: downloadId }, resolve));
-  const item = results && results[0];
-  return !!item && (item.fileSize || 0) > 20000;
+// Fallback when the browser's own download of the URL is rejected: fetch it from
+// the offscreen document (extension origin + host permissions, so no CORS issue),
+// which hands back a blob: URL that chrome.downloads can save.
+async function downloadViaOffscreen(url, filename) {
+  const request = { action: 'fetch-to-blob-url', url, minBytes: MIN_VALID_MEDIA_BYTES };
+  await ensureOffscreenDocument();
+  let result;
+  try {
+    result = await sendToOffscreen(request);
+  } catch (e) {
+    // The cached "ready" promise can outlive the document (closed by Chrome or
+    // DevTools) -> "Receiving end does not exist". Recreate it once and retry.
+    offscreenReady = null;
+    await ensureOffscreenDocument();
+    result = await sendToOffscreen(request);
+  }
+  if (!result?.success || !result.blobUrl) {
+    console.warn('Offscreen fetch failed:', result?.error);
+    return null;
+  }
+  const revoke = () => sendToOffscreen({ action: 'revoke-blob-url', blobUrl: result.blobUrl }).catch(() => {});
+  try {
+    const downloadId = await queueDownload(result.blobUrl, filename);
+    // Local blob - should finish fast; keep the blob alive until it has
+    const ok = await verifyDownload(downloadId, 60000);
+    if (!ok) {
+      discardDownload(downloadId);
+      revoke();
+      return null;
+    }
+    waitForDownloadEnd(downloadId, 10 * 60 * 1000).then(revoke);
+    return downloadId;
+  } catch (e) {
+    revoke();
+    throw e;
+  }
+}
+
+function waitForDownloadEnd(downloadId, timeoutMs) {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + timeoutMs;
+    const check = () => chrome.downloads.search({ id: downloadId }, (results) => {
+      const item = results && results[0];
+      if (!item || item.state !== 'in_progress' || Date.now() >= deadline) return resolve();
+      setTimeout(check, 1000);
+    });
+    check();
+  });
 }
 
 // Downloads a resolved googlevideo stream: tries the browser's own download
-// pipeline first (fastest, no CORS concerns), then falls back to fetching with a
-// spoofed YouTube referrer and downloading the resulting blob if that's rejected.
+// pipeline first (fastest, streams to disk), then falls back to the offscreen fetch.
 async function downloadStreamUrl(streamUrl, filename) {
   try {
     const downloadId = await queueDownload(streamUrl, filename);
-    if (await waitForDownloadResult(downloadId, 8000) && await isDownloadValid(downloadId)) {
-      return downloadId;
-    }
-    chrome.downloads.erase({ id: downloadId }, () => {});
+    if (await verifyDownload(downloadId, 20000)) return downloadId;
+    discardDownload(downloadId);
   } catch (e) {
-    console.warn('Direct stream download failed, trying fetch:', e);
+    console.warn('Direct stream download failed, trying offscreen fetch:', e);
   }
 
-  let response;
   try {
-    response = await fetch(streamUrl, {
-      headers: {
-        'Referer': 'https://www.youtube.com/',
-        'User-Agent': navigator.userAgent
-      }
-    });
+    return await downloadViaOffscreen(streamUrl, filename);
   } catch (e) {
-    console.warn('Fetch-based YouTube download failed:', e);
+    console.warn('Offscreen YouTube download failed:', e);
     return null;
-  }
-  if (!response.ok) return null;
-  const blob = await response.blob();
-  if (blob.size <= 20000) return null;
-  const blobUrl = URL.createObjectURL(blob);
-  try {
-    const downloadId = await queueDownload(blobUrl, filename);
-    if (await waitForDownloadResult(downloadId, 15000)) return downloadId;
-    chrome.downloads.erase({ id: downloadId }, () => {});
-    return null;
-  } finally {
-    URL.revokeObjectURL(blobUrl);
   }
 }
 
 async function handleYouTubeDownload(request, sendResponse) {
   try {
-    const { videoId, filename, tabId, watchUrl, isShorts } = request;
+    const { videoId, filename, tabId, watchUrl, isShorts, streamUrl: knownStreamUrl } = request;
     if (!videoId) {
       sendResponse({ success: false, error: 'No video ID provided' });
       return;
     }
     const finalFilename = filename || `yt_${videoId}.mp4`;
 
-    let streamUrl = tabId ? await extractStreamFromTab(tabId, 5000) : null;
+    const tried = new Set();
+    let foundAnyStream = false;
+    const attempt = async (url) => {
+      if (!url || !/googlevideo/i.test(url) || tried.has(url)) return null;
+      tried.add(url);
+      foundAnyStream = true;
+      return downloadStreamUrl(url, finalFilename);
+    };
 
-    // Not the video currently open in that tab (e.g. a feed thumbnail) - resolve
-    // it from its own watch page in the background instead.
-    if (!streamUrl || !/googlevideo/i.test(streamUrl)) {
+    // 1. A stream the popup already resolved for exactly this video
+    let downloadId = await attempt(knownStreamUrl);
+
+    // 2. The user's tab - but only if it is actually showing this video. Its network
+    //    traffic carries no video id, so a feed/other video would be captured instead.
+    if (!downloadId && tabId && await tabShowsVideo(tabId, videoId)) {
+      downloadId = await attempt(await extractStreamFromTab(tabId, 5000, videoId, false));
+    }
+
+    // 3. Load the video's own watch page in a hidden background tab
+    if (!downloadId) {
       const resolvedWatchUrl = watchUrl || (isShorts
         ? `https://www.youtube.com/shorts/${videoId}`
         : `https://www.youtube.com/watch?v=${videoId}`);
-      streamUrl = await resolveStreamViaHiddenTab(videoId, resolvedWatchUrl);
+      downloadId = await attempt(await resolveStreamViaHiddenTab(videoId, resolvedWatchUrl));
     }
 
-    if (streamUrl && /googlevideo/i.test(streamUrl)) {
-      const downloadId = await downloadStreamUrl(streamUrl, finalFilename);
-      if (downloadId) {
-        sendResponse({ success: true, downloadId });
-        return;
-      }
+    if (downloadId) {
+      sendResponse({ success: true, downloadId });
+      return;
+    }
+
+    if (foundAnyStream) {
       // A stream URL was found but produced no usable file - this happens when
       // YouTube only offers its newer SABR/UMP delivery for this video, which needs
       // the player's own chunk-negotiation protocol rather than a single GET request.
-      sendResponse({ success: false, error: 'Found a stream but could not download real video data from it (this video may only be available via YouTube\'s newer streaming protocol, which this extension can\'t decode).' });
+      sendResponse({ success: false, error: 'Found a stream but could not download real video data from it (this video may only be available via YouTube\'s newer streaming protocol). Open the video in the tab and download again to record it instead.' });
       return;
     }
 
@@ -449,22 +558,26 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     }
 
     if (mediaUrl) {
-      // Blob URLs are scoped to the tab's document - resolve them inside the tab first
-      if (mediaUrl.startsWith('blob:') && tab && tab.id) {
-        mediaUrl = await resolveBlobUrl(tab.id, mediaUrl);
+      const guessedExt = info.mediaType === 'image' ? '.jpg'
+        : info.mediaType === 'video' ? '.mp4'
+        : info.mediaType === 'audio' ? '.mp3' : '';
+
+      // Blob URLs are scoped to the tab's document - save them from inside the tab.
+      // (Converting to a data: URL and downloading from here breaks for anything
+      // over ~2 MB, i.e. practically every blob video.)
+      // tab.id is -1 (TAB_ID_NONE) for e.g. the PDF viewer - can't inject there
+      if (mediaUrl.startsWith('blob:') && tab && tab.id > 0) {
+        await downloadBlobInTab(tab.id, mediaUrl, `media-${Date.now()}${guessedExt || '.bin'}`);
+        return;
       }
 
       // Convert to original high-resolution URL
       mediaUrl = getHighResUrl(mediaUrl);
 
-      // Determine file extension
-      let filename = mediaUrl.split('/').pop().split('?')[0] || `media-${Date.now()}`;
-      if (!filename.includes('.')) {
-        // Guess extension from mediaType context
-        if (info.mediaType === 'image') filename += '.jpg';
-        else if (info.mediaType === 'video') filename += '.mp4';
-        else if (info.mediaType === 'audio') filename += '.mp3';
-      }
+      // Determine file name - data: URLs have no path, so name them from their MIME type
+      const filename = mediaUrl.startsWith('data:')
+        ? `media-${Date.now()}${extFromDataUrl(mediaUrl) || guessedExt || '.bin'}`
+        : filenameFromUrl(mediaUrl, guessedExt);
 
       // Download the media file
       chrome.downloads.download({
@@ -488,15 +601,20 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       const postUrl = info.linkUrl || info.pageUrl || (tab ? tab.url : null);
       
       const downloadFallbackMedia = (url, type) => {
-        let filename = url.split('/').pop().split('?')[0] || `media-${Date.now()}`;
-        if (!filename.includes('.')) {
-          filename += (type === 'video' ? '.mp4' : '.jpg');
-        }
+        if (!url) return;
+        const ext = type === 'video' ? '.mp4' : '.jpg';
+        const filename = url.startsWith('data:')
+          ? `media-${Date.now()}${extFromDataUrl(url) || ext}`
+          : filenameFromUrl(url, ext);
         chrome.downloads.download({
           url: url,
           filename: filename,
           saveAs: false,
           conflictAction: 'uniquify'
+        }, () => {
+          if (chrome.runtime.lastError) {
+            console.error('Fallback download failed:', chrome.runtime.lastError.message);
+          }
         });
       };
 
@@ -504,26 +622,29 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         try {
           const response = await fetch(postUrl);
           const html = await response.text();
-          // Unescape JSON Unicode escapes and backslashes in HTML payload
+          // Unescape JSON-in-HTML: "&" -> "&" and "https:\/\/x\/a.mp4" -> "https://x/a.mp4".
+          // (These used to match a *double* backslash, so the common single-backslash
+          // form was never unescaped and step 3 below could not find escaped URLs.)
           const cleanHtml = html
-            .replace(/\\\\u([0-9a-fA-F]{4})/g, (_, grp) => String.fromCharCode(parseInt(grp, 16)))
-            .replace(/\\\\/g, '');
-          
+            .replace(/\\u([0-9a-fA-F]{4})/g, (_, grp) => String.fromCharCode(parseInt(grp, 16)))
+            .replace(/\\\//g, '/');
+
           let extractedUrl = null;
           let type = 'image';
-          
-          // 1. Try OpenGraph video
-          const ogVideoMatch = html.match(/<meta\s+(?:property|name)=["']og:video(?:[:w]*)?["']\s+content=["']([^"']+)["']/i) || 
-                               html.match(/<meta\s+content=["']([^"']+)["']\s+(?:property|name)=["']og:video(?:[:w]*)?["']/i);
+
+          // 1. Try OpenGraph video (og:video, og:video:url, og:video:secure_url).
+          //    Content must be a URL - og:video:type / :width also match the name.
+          const ogVideoMatch = html.match(/<meta\s+(?:property|name)=["']og:video(?::(?:url|secure_url))?["']\s+content=["'](https?:[^"']+)["']/i) ||
+                               html.match(/<meta\s+content=["'](https?:[^"']+)["']\s+(?:property|name)=["']og:video(?::(?:url|secure_url))?["']/i);
           if (ogVideoMatch && ogVideoMatch[1]) {
             extractedUrl = ogVideoMatch[1];
             type = 'video';
-          } 
-          
+          }
+
           // 2. Try OpenGraph image (if not a generic profile pic)
           if (!extractedUrl) {
-            const ogImageMatch = html.match(/<meta\s+(?:property|name)=["']og:image(?:[:w]*)?["']\s+content=["']([^"']+)["']/i) ||
-                                 html.match(/<meta\s+content=["']([^"']+)["']\s+(?:property|name)=["']og:image(?:[:w]*)?["']/i);
+            const ogImageMatch = html.match(/<meta\s+(?:property|name)=["']og:image(?::(?:url|secure_url))?["']\s+content=["'](https?:[^"']+)["']/i) ||
+                                 html.match(/<meta\s+content=["'](https?:[^"']+)["']\s+(?:property|name)=["']og:image(?::(?:url|secure_url))?["']/i);
             if (ogImageMatch && ogImageMatch[1] && !ogImageMatch[1].includes('profile_pic')) {
               extractedUrl = ogImageMatch[1];
               type = 'image';
@@ -546,7 +667,11 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
           }
           
           if (extractedUrl) {
-            extractedUrl = extractedUrl.replace(/u0026/g, '&').replace(/x26/g, '&');
+            // og: meta content is HTML-escaped (&amp;), JSON blobs use & / \x26
+            extractedUrl = extractedUrl
+              .replace(/&amp;/g, '&')
+              .replace(/\\?u0026/g, '&')
+              .replace(/\\?x26/g, '&');
             downloadFallbackMedia(extractedUrl, type);
             return; // Success
           }
@@ -556,7 +681,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       }
       
       // 4. In-page script fallback if fetch fails or URL is unreachable
-      if (tab && tab.id) {
+      if (tab && tab.id > 0) {
         chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: () => {
@@ -586,24 +711,34 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
                 if (area > maxArea) { maxArea = area; largest = i; }
               });
               
-              let bestUrl = largest.src;
+              // Pick the biggest srcset candidate by its descriptor. Splitting on ","
+              // broke URLs that contain commas (e.g. ".../w_800,h_600/x.jpg"), and the
+              // candidate can be relative, so resolve it against the page.
+              let bestUrl = largest.currentSrc || largest.src;
               if (largest.srcset) {
-                const parts = largest.srcset.split(',');
-                const lastPart = parts[parts.length - 1].trim().split(/\s+/)[0];
-                if (lastPart) bestUrl = lastPart;
+                let bestSize = 0;
+                const re = /(\S+)\s+(\d+(?:\.\d+)?)([wx])(?:,|$)/g;
+                let m;
+                while ((m = re.exec(largest.srcset)) !== null) {
+                  const size = parseFloat(m[2]) * (m[3] === 'x' ? 10000 : 1);
+                  if (size > bestSize) { bestSize = size; bestUrl = m[1]; }
+                }
               }
+              try { bestUrl = new URL(bestUrl, location.href).href; } catch (_) {}
               return { url: bestUrl, type: 'image' };
             }
             return null;
           }
         }, (results) => {
-          if (results && results[0] && results[0].result) {
+          if (chrome.runtime.lastError) {
+            console.error('In-page media lookup failed:', chrome.runtime.lastError.message);
+            return;
+          }
+          if (results && results[0] && results[0].result && results[0].result.url) {
             const media = results[0].result;
             if (media.url.startsWith('blob:')) {
-              chrome.scripting.executeScript({
-                target: { tabId: tab.id },
-                func: () => alert('Blob video detected. Please open the Auto Downloader Popup to download this video properly.')
-              });
+              const ext = media.type === 'video' ? '.mp4' : '.jpg';
+              downloadBlobInTab(tab.id, media.url, `media-${Date.now()}${ext}`);
               return;
             }
             downloadFallbackMedia(media.url, media.type);
@@ -619,29 +754,67 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   }
 });
 
-// Resolve a blob: URL created inside a tab's document by fetching it there and
-// converting it to a data URL, since blob URLs aren't reachable from the extension context.
-async function resolveBlobUrl(tabId, blobUrl) {
+// A blob: URL only resolves inside the document that created it, so trigger the save
+// from that tab with an <a download> click (no size limit, unlike a data: URL).
+async function downloadBlobInTab(tabId, blobUrl, filename) {
   try {
     const result = await chrome.scripting.executeScript({
       target: { tabId },
-      func: async (url) => {
-        const response = await fetch(url);
-        const blob = await response.blob();
-        return await new Promise((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onloadend = () => resolve(reader.result);
-          reader.onerror = () => reject(reader.error);
-          reader.readAsDataURL(blob);
-        });
+      func: async (url, name) => {
+        try {
+          // Fetching it first proves the blob is still alive (revoked ones throw)
+          const blob = await (await fetch(url)).blob();
+          if (!blob.size) return { error: 'Empty blob' };
+          // MediaSource-backed players (most social video) expose blob: URLs that
+          // can't be fetched as a file - those throw above.
+          const localUrl = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = localUrl;
+          a.download = name;
+          a.style.display = 'none';
+          document.documentElement.appendChild(a);
+          a.click();
+          a.remove();
+          setTimeout(() => URL.revokeObjectURL(localUrl), 120000);
+          return { ok: true };
+        } catch (e) {
+          return { error: e.message || String(e) };
+        }
       },
-      args: [blobUrl]
+      args: [blobUrl, filename]
     });
-    return (result && result[0] && result[0].result) || blobUrl;
+    const outcome = result && result[0] && result[0].result;
+    if (!outcome?.ok) {
+      notify('Download failed', 'This video is streamed (blob/MediaSource) - open the Auto Downloader popup to record it instead.');
+    }
   } catch (e) {
-    console.error('Failed to resolve blob URL from context menu:', e);
-    return blobUrl;
+    console.error('Failed to download blob URL from context menu:', e);
+    notify('Download failed', e.message);
   }
+}
+
+// Extension (".png") for a data: URL from its MIME type, or ''
+function extFromDataUrl(dataUrl) {
+  const m = /^data:([a-z]+)\/([a-z0-9.+-]+)/i.exec(dataUrl || '');
+  if (!m) return '';
+  const sub = m[2].toLowerCase();
+  const map = { jpeg: '.jpg', 'svg+xml': '.svg', quicktime: '.mov', mpeg: m[1] === 'audio' ? '.mp3' : '.mpeg', 'x-icon': '.ico' };
+  return map[sub] || `.${sub.replace(/[^a-z0-9]/g, '')}`;
+}
+
+// Safe download filename from a URL's last path segment, with a fallback extension
+function filenameFromUrl(url, fallbackExt) {
+  let name = '';
+  try {
+    name = decodeURIComponent(new URL(url).pathname.split('/').pop() || '');
+  } catch (_) {
+    name = (url.split('/').pop() || '').split('?')[0];
+  }
+  // chrome.downloads rejects names with reserved characters or a leading dot
+  name = name.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').replace(/^\.+/, '').trim().slice(0, 150);
+  if (!name) name = `media-${Date.now()}`;
+  if (!/\.[a-z0-9]{2,5}$/i.test(name)) name += fallbackExt || '';
+  return name;
 }
 
 // Get original/high-resolution URL by removing sizing parameters and CDN suffixes
@@ -651,11 +824,13 @@ function getHighResUrl(url) {
   }
   
   // Helper to unescape JSON Unicode escapes and backslashes
+  // Same single-backslash rules as popup.js (the old double-backslash patterns never
+  // matched a normal "&" / "\/" escape)
   const unescapeUrl = (u) => {
     if (!u || typeof u !== 'string') return u;
     return u
-      .replace(/\\\\u([0-9a-fA-F]{4})/g, (_, grp) => String.fromCharCode(parseInt(grp, 16)))
-      .replace(/\\\\/g, '')
+      .replace(/\\u([0-9a-fA-F]{4})/g, (_, grp) => String.fromCharCode(parseInt(grp, 16)))
+      .replace(/\\/g, '')
       .trim();
   };
 

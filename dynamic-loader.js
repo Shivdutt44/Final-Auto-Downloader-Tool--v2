@@ -28,12 +28,24 @@
     return null;
   }
 
+  // Scripts, styles, API calls and beacons are never media - whatever the host
+  function isNonMediaUrl(url) {
+    if (/^(data|blob):/i.test(url)) return false;
+    let path = url;
+    try { path = new URL(url, location.href).pathname; } catch (_) {}
+    return /\.(m?js|css|json|wasm|html?|xml|txt|map|woff2?|ttf|otf|eot)$/i.test(path) ||
+      /generate_204/i.test(url) || /^\/?$/.test(path);
+  }
+
   function isMediaLikeUrl(url) {
     if (!url || typeof url !== 'string') return false;
     if (url.startsWith('blob:') || url.startsWith('data:image') || url.startsWith('data:video') || url.startsWith('data:audio')) {
       return true;
     }
-    if (/googlevideo\.com|ytimg\.com|ggpht\.com|googleusercontent\.com/i.test(url)) return true;
+    if (isNonMediaUrl(url)) return false;
+    // googlevideo: only real stream requests, not /initplayback warm-up pings
+    if (/googlevideo\.com/i.test(url)) return /\/videoplayback/i.test(url);
+    if (/ytimg\.com|ggpht\.com|googleusercontent\.com/i.test(url)) return true;
     if (/youtube\.com|youtu\.be/i.test(url) && ytIdFromUrl(url)) return true;
     if (/instagram\.com\/(?:reel|reels|p)\//i.test(url)) return true;
     if (/\.(mp4|webm|mov|m3u8|mpd|ts|m4v|jpe?g|png|gif|webp|mp3|wav|ogg)(?:[\?#]|$)/i.test(url)) return true;
@@ -54,7 +66,9 @@
     if (/\.(mp3|wav|ogg|flac|m4a|aac)(?:[\?#]|$)/i.test(url)) return 'audio';
     if (
       /\.(mp4|webm|mov|m3u8|mpd|ts|m4v)(?:[\?#]|$)/i.test(url) ||
-      /youtube\.com|youtu\.be|googlevideo\.com|videoplayback|instagram\.com\/(?:reel|reels)/i.test(url)
+      /googlevideo\.com|videoplayback|instagram\.com\/(?:reel|reels)/i.test(url) ||
+      // a youtube.com URL is only a video when it names one (not channels/search/scripts)
+      (/youtube\.com|youtu\.be/i.test(url) && ytIdFromUrl(url))
     ) {
       return 'video';
     }
@@ -167,10 +181,13 @@
         const id = ytIdFromUrl(href);
         if (id) {
           const isShorts = /\/shorts\//i.test(href);
+          // Thumbnail anchors only contain the duration overlay ("0:19 Now playing")
+          const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+          const textTitle = text.length >= 3 && !/^[\d:\s]+(now playing|live|shorts)?$/i.test(text) ? text.slice(0, 120) : null;
           const title =
             node.getAttribute('title') ||
             node.getAttribute('aria-label') ||
-            (node.textContent || '').trim().slice(0, 120) ||
+            textTitle ||
             null;
           pushMedia({
             url: isShorts ? `https://www.youtube.com/shorts/${id}` : `https://www.youtube.com/watch?v=${id}`,
@@ -261,10 +278,9 @@
           if (n.nodeType === 1) scanNode(n);
         });
       } else if (mutation.type === 'attributes') {
-        const name = mutation.attributeName;
-        if (name === 'src' || name === 'href' || name === 'srcset' || name === 'video-id' || name === 'data-video-id') {
-          scanNode(mutation.target);
-        }
+        // attributeFilter below already limits this to the media-relevant attributes
+        // (src, href, srcset, poster, video-id, data-video-id, data-videoid)
+        scanNode(mutation.target);
       }
     }
   });
@@ -294,20 +310,22 @@
     } catch (_) {}
   });
 
-  // Poll data-amd-streams attribute written by MAIN world hooks
+  // Poll data-amd-streams attribute written by MAIN world hooks.
+  // Entries are { url, videoId } - the id was captured together with the stream, so
+  // a stream from an earlier SPA page is never relabelled as the current video.
   function pollMainWorldStreams() {
     try {
       const raw = document.documentElement.getAttribute('data-amd-streams');
       if (!raw) return;
       const list = JSON.parse(raw);
-      const vid = document.documentElement.getAttribute('data-amd-vid');
       if (Array.isArray(list)) {
-        list.forEach((url) => {
+        list.forEach((entry) => {
+          if (!entry || typeof entry !== 'object' || !entry.url) return;
           pushMedia({
-            url,
-            streamUrl: url,
+            url: entry.url,
+            streamUrl: entry.url,
             type: 'video',
-            videoId: vid || ytIdFromUrl(location.href),
+            videoId: entry.videoId || null,
             source: 'main-world-attr',
             force: true
           });
@@ -335,28 +353,27 @@
   }, 2000);
 
   // SPA navigation (YouTube client-side routing)
+  // Debounced: several navigation signals usually fire for one navigation
+  let navTimer = null;
   const notifyNav = () => {
-    setTimeout(() => {
+    clearTimeout(navTimer);
+    navTimer = setTimeout(() => {
       scanNode(document.body || document.documentElement);
       scanPerformance();
     }, 800);
   };
 
-  const _pushState = history.pushState;
-  const _replaceState = history.replaceState;
-  history.pushState = function () {
-    const r = _pushState.apply(this, arguments);
-    notifyNav();
-    return r;
-  };
-  history.replaceState = function () {
-    const r = _replaceState.apply(this, arguments);
-    notifyNav();
-    return r;
-  };
+  // This script runs in the extension's isolated world, where patching
+  // history.pushState never sees the page's own calls. The MAIN-world hook installed
+  // by popup.js (ensureDynamicLoader) patches it there and fires 'amd-navigate' -
+  // DOM events cross worlds, so we listen for that plus YouTube's own events.
+  window.addEventListener('amd-navigate', notifyNav);
   window.addEventListener('popstate', notifyNav);
-  window.addEventListener('yt-navigate-finish', notifyNav);
-  window.addEventListener('yt-page-data-updated', notifyNav);
+  // Listen at document and window level (a duplicate only causes an extra rescan)
+  ['yt-navigate-finish', 'yt-page-data-updated'].forEach((evt) => {
+    document.addEventListener(evt, notifyNav);
+    window.addEventListener(evt, notifyNav);
+  });
 
   // Expose helpers for popup-injected scroll loader
   window.__AMD_SCROLL_LOAD__ = async function scrollLoadMore(rounds = 6, pauseMs = 900) {
@@ -366,27 +383,42 @@
       document.documentElement.scrollHeight
     );
 
+    // An element that really scrolls on its own (YouTube's #contents does not - the
+    // window scrolls - so blindly setting its scrollTop did nothing)
+    const isScrollable = (el) => {
+      if (!el) return false;
+      const oy = getComputedStyle(el).overflowY;
+      return (oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 10;
+    };
+
     for (let i = 0; i < rounds; i++) {
       const before = heightBefore();
-      // Prefer YouTube shorts / feed containers
-      const scrollRoot =
-        document.querySelector('#shorts-container') ||
-        document.querySelector('ytd-shorts') ||
-        document.querySelector('#contents') ||
-        document.scrollingElement ||
-        document.documentElement;
 
-      if (scrollRoot === document.scrollingElement || scrollRoot === document.documentElement) {
-        window.scrollBy(0, Math.max(window.innerHeight * 0.9, 600));
-      } else {
-        scrollRoot.scrollTop = scrollRoot.scrollTop + Math.max(scrollRoot.clientHeight * 0.9, 600);
-        // Also nudge window for hybrid layouts
-        window.scrollBy(0, Math.max(window.innerHeight * 0.5, 400));
-      }
-
-      // Keyboard-like short navigation on Shorts
       if (location.pathname.startsWith('/shorts')) {
-        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+        // Shorts: one Short per step - scroll the reel container and send ArrowDown
+        const shorts = document.querySelector('#shorts-inner-container, #shorts-container, ytd-shorts');
+        if (isScrollable(shorts)) shorts.scrollTop += shorts.clientHeight;
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40, bubbles: true }));
+      } else {
+        // Infinite feeds load the next page when their continuation spinner comes
+        // into view - jump straight to it (or to the very bottom) instead of
+        // nudging 400px at a time, which never reached it on long result pages.
+        // Only a *rendered* continuation counts - YouTube keeps hidden ones (e.g. in
+        // the guide/sidebar) and scrollIntoView on those does nothing.
+        const rendered = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+        const continuation = Array.from(document.querySelectorAll('ytd-continuation-item-renderer, #continuations'))
+          .filter(rendered).pop();
+        const inner = Array.from(document.querySelectorAll('#contents, main, [role="feed"]')).find(isScrollable);
+        const startY = window.scrollY;
+        if (continuation) {
+          continuation.scrollIntoView({ block: 'end' });
+        } else if (inner) {
+          inner.scrollTop = inner.scrollHeight;
+        }
+        // Whatever happened above, make sure the page itself reaches the bottom
+        if (!inner && Math.abs(window.scrollY - startY) < 5) {
+          window.scrollTo(0, heightBefore());
+        }
       }
 
       await new Promise((r) => setTimeout(r, pauseMs));
