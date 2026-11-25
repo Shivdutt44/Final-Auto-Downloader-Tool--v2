@@ -82,6 +82,14 @@ body {
   50% { transform: translateY(-4px); }
 }
 
+.header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .refresh-btn {
   background: rgba(255, 255, 255, 0.2);
   border: 1px solid rgba(255, 255, 255, 0.4);
@@ -105,12 +113,58 @@ body {
   box-shadow: 0 4px 12px rgba(255, 255, 255, 0.2);
 }
 
+.refresh-btn:disabled {
+  opacity: 0.7;
+  cursor: wait;
+  transform: none;
+}
+
 .refresh-btn svg {
   transition: transform 0.4s ease;
 }
 
 .refresh-btn:hover svg {
   transform: rotate(180deg);
+}
+
+.load-more-btn:hover svg {
+  transform: translateY(2px);
+}
+
+.load-more-btn.loading {
+  background: rgba(255, 255, 255, 0.35);
+}
+
+.preview-title {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 10px;
+  color: var(--dark-color);
+  text-align: center;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.yt-embed-wrap {
+  width: 100%;
+  min-height: 220px;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #000;
+}
+
+.yt-embed-wrap iframe {
+  width: 100%;
+  min-height: 220px;
+  border: 0;
+  display: block;
+}
+
+.download-btn.secondary-dl {
+  margin-top: 8px;
+  background: #2d3436;
 }
 
 .main-footer {
@@ -163,6 +217,8 @@ body {
   box-shadow: 0 4px 10px rgba(0,0,0,0.02);
   border: 1px solid rgba(108, 92, 231, 0.05);
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  cursor: pointer;
+  user-select: none;
 }
 
 .stat-card:hover {
@@ -171,11 +227,27 @@ body {
   box-shadow: 0 6px 15px rgba(108, 92, 231, 0.08);
 }
 
+.stat-card:active {
+  transform: translateY(0);
+}
+
+.stat-card.active {
+  background: var(--header-gradient);
+  border-color: transparent;
+  box-shadow: 0 6px 15px rgba(108, 92, 231, 0.35);
+}
+
+.stat-card.active .stat-value,
+.stat-card.active .stat-label {
+  color: white;
+}
+
 .stat-value {
   font-size: 20px;
   font-weight: 700;
   color: var(--primary-color);
   margin-bottom: 2px;
+  transition: color 0.3s ease;
 }
 
 .stat-label {
@@ -184,6 +256,7 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.5px;
   color: #718096;
+  transition: color 0.3s ease;
 }
 
 .filters {
